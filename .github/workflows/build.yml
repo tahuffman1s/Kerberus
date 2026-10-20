@@ -50,7 +50,7 @@ jobs:
       - name: Integration tests (AppImage, host Kerberos tools)
         run: KERBERUS_TOOLS=host tests/integration.sh dist/Kerberus-*.AppImage --appimage-extract-and-run
 
-      - name: Integration tests (AppImage, bundled Kerberus tools)
+      - name: Integration tests (AppImage, bundled Kerberos tools)
         run: KERBERUS_TOOLS=bundled tests/integration.sh dist/Kerberus-*.AppImage --appimage-extract-and-run
 
       - uses: actions/upload-artifact@v4
