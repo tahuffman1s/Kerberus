@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Kerberus
+GenericName=Kerberos Ticket Manager
+Comment=Get, renew and destroy Kerberos tickets
+Exec=kerberus
+Icon=io.github.tahuffman1s.Kerberus
+Terminal=false
+Categories=System;Security;
+Keywords=kerberos;krb5;kinit;klist;ticket;tgt;realm;sso;
+StartupNotify=true

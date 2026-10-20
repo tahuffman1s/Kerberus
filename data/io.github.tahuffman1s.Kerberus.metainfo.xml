@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.tahuffman1s.Kerberus</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT</project_license>
+  <name>Kerberus</name>
+  <summary>Get, renew and destroy Kerberos tickets</summary>
+  <description>
+    <p>
+      Kerberus shows the Kerberos tickets in your credential caches and keeps them
+      from running out. It works with the machine's own krb5.conf and caches, so
+      tickets it gets are the ones kinit and klist see.
+    </p>
+    <ul>
+      <li>See every principal in the cache collection, when its tickets expire and how long they can be renewed</li>
+      <li>Sign in, renew, switch the default principal and destroy tickets</li>
+      <li>Renew tickets automatically before they expire, in the background if you like</li>
+      <li>Optionally keep the password in the keyring to sign in again when a ticket can't be renewed</li>
+      <li>Change your Kerberos password, including one that has expired</li>
+    </ul>
+  </description>
+  <developer id="io.github.tahuffman1s">
+    <name>tahuffman1s</name>
+  </developer>
+  <url type="homepage">https://github.com/tahuffman1s/kerberus</url>
+  <url type="bugtracker">https://github.com/tahuffman1s/kerberus/issues</url>
+  <launchable type="desktop-id">io.github.tahuffman1s.Kerberus.desktop</launchable>
+  <provides>
+    <binary>kerberus</binary>
+  </provides>
+  <requires>
+    <display_length compare="ge">360</display_length>
+  </requires>
+  <content_rating type="oars-1.1"/>
+  <releases>
+  </releases>
+</component>

@@ -1,0 +1,72 @@
+name: Build
+
+# Every push and pull request builds and tests the AppImage. A push to main also
+# tags the next version (packaging/next-version.sh) and publishes a GitHub
+# release with the AppImage and its .zsync update file.
+on:
+  push:
+    branches: ["**"]
+    paths-ignore: ["**.md", "LICENSE"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  # Releases on main run one at a time so each sees the tag before it.
+  group: build-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  appimage:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0  # tags and history for the version
+
+      - name: Work out the version
+        id: version
+        env:
+          RELEASE: ${{ github.ref == 'refs/heads/main' && github.event_name != 'pull_request' }}
+        run: packaging/next-version.sh | tee -a "$GITHUB_OUTPUT"
+
+      - name: Install build dependencies
+        run: sudo packaging/appimage/deps.sh
+
+      - name: Unit tests
+        run: /usr/bin/python3 -m unittest discover -s tests -v
+
+      - name: Integration tests (from source)
+        run: tests/integration.sh /usr/bin/python3 kerberus.py
+
+      - name: Build the AppImage
+        run: packaging/appimage/build.sh "${{ steps.version.outputs.version }}"
+
+      - name: Smoke test the window
+        run: GSK_RENDERER=cairo xvfb-run -a dist/Kerberus-*.AppImage --appimage-extract-and-run --smoke-test
+
+      - name: Integration tests (AppImage, host Kerberos tools)
+        run: KERBERUS_TOOLS=host tests/integration.sh dist/Kerberus-*.AppImage --appimage-extract-and-run
+
+      - name: Integration tests (AppImage, bundled Kerberus tools)
+        run: KERBERUS_TOOLS=bundled tests/integration.sh dist/Kerberus-*.AppImage --appimage-extract-and-run
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Kerberus-${{ steps.version.outputs.version }}
+          path: dist/*
+          if-no-files-found: error
+
+      - name: Tag and release
+        if: steps.version.outputs.release == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.version.outputs.tag }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          gh release create "$TAG" dist/* \
+            --target "$GITHUB_SHA" \
+            --title "Kerberus $VERSION" \
+            --generate-notes
