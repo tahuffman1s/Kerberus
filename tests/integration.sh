@@ -38,6 +38,13 @@ check      "second principal"        "Signed in as bob@$realm"         k_with_in
 check      "list both"               "alice@$realm"                    k list
 check      "json"                    "\"principal\": \"bob@$realm\""   k list --json
 check      "switch default"          "alice@$realm is now the default" k switch alice
+if [ -n "${KERBERUS_KCM:-}" ]; then
+    # The ntlm_auth helper Kerberus wrote reaches the server; without a window there's nobody to ask.
+    helper=$work/config/kerberus/bin/ntlm_auth
+    ntlm() { printf 'YR\nTT %s\n' "$(printf 'NTLMSSP\0\2\0\0\0' | base64 -w0)" | "$helper" --helper-protocol ntlmssp-client-1 --use-cached-creds --username alice; }
+    check  "ntlm_auth helper negotiates" "^YR TlRMTVNTUAABAAAA"            ntlm
+    check  "and has no credentials"      "^BH "                            ntlm
+fi
 check      "default moved"           "^alice@$realm  \(default\)"      k list
 check      "renew"                   "Renewed the ticket for alice"    k renew
 check      "renew all"               "Renewed the ticket for bob"      k renew --all

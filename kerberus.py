@@ -21,17 +21,23 @@ With sign-in prompts turned on (Preferences), Kerberus is also the session's
 credential cache: it serves the KCM protocol on a socket that every Kerberos
 app is pointed at, so when an app (a browser doing Negotiate, smbclient, ssh)
 needs a ticket and there isn't a valid one, Kerberus asks who to sign in as and
-the app carries on once you have.
+the app carries on once you have. It also stands in for Samba's ntlm_auth helper,
+so Firefox's NTLM sign-ins (network.automatic-ntlm-auth.trusted-uris) are
+answered the same way, with no winbind.
 """
 
 import argparse
 import base64
+import binascii
 import datetime as dt
 import getpass
+import hashlib
+import hmac
 import json
 import os
 import re
 import secrets
+import shlex
 import shutil
 import socket
 import struct
@@ -60,6 +66,8 @@ DEFAULT_SETTINGS = {
     "kcm": False,             # be the session's credential cache and prompt when apps need a ticket
     "prompt_timeout": 120,    # seconds an app waits for you to sign in
     "ignored_apps": [],       # apps that never get a sign-in prompt
+    "ntlm": True,             # answer NTLM sign-ins for apps that use Samba's ntlm_auth helper (Firefox)
+    "ntlm_domain": "",        # the Windows domain sent with NTLM; "" is the first part of the realm
     "identities": [],         # principals signed in with before, most recent first
     "kcm_offer_dismissed": False,
     "last_principal": "",
@@ -894,29 +902,38 @@ def others_can_replace(parent, uid=None):
     return parent.st_uid != uid and not parent.st_mode & 0o1000 and bool(parent.st_mode & 0o022)
 
 
+def parent_pid(pid):
+    """The parent of a process, or 0."""
+    try:
+        with open(f"/proc/{pid}/stat") as f:
+            return int(f.read().rpartition(")")[2].split()[1])
+    except (OSError, ValueError, IndexError):
+        return 0
+
+
 def descends_from(pid, ancestor):
     for _ in range(64):
         if pid == ancestor:
             return True
         if pid <= 1:
             return False
-        try:
-            with open(f"/proc/{pid}/stat") as f:
-                pid = int(f.read().rpartition(")")[2].split()[1])
-        except (OSError, ValueError, IndexError):
-            return False
+        pid = parent_pid(pid)
     return False
 
 
-class KcmServer:
-    """Serves a KcmStore on a Unix socket, one thread per connection.
+def peer_of(conn):
+    """(pid, uid) of the process on the other end of a Unix socket."""
+    pid, uid, _ = struct.unpack("3i", conn.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i")))
+    return pid, uid
 
-    need_ticket(client, cache_name) is called, on that connection's thread,
-    when an app asks for a cache without a valid TGT; the request waits until it
-    returns, so a ticket you sign in for answers the request that asked."""
 
-    def __init__(self, store, path=KCM_SOCKET, need_ticket=None, log=print):
-        self.store, self.path, self.need_ticket, self.log = store, Path(path), need_ticket, log
+class UnixServer:
+    """A Unix socket in the runtime directory, served one thread per connection."""
+
+    name = "socket"
+
+    def __init__(self, path, log=print):
+        self.path, self.log = Path(path), log
         self.sock = None
 
     def start(self):
@@ -942,7 +959,7 @@ class KcmServer:
         self.sock.bind(str(self.path))
         os.chmod(self.path, 0o600)
         self.sock.listen(32)
-        threading.Thread(target=self.accept_loop, daemon=True, name="kcm-accept").start()
+        threading.Thread(target=self.accept_loop, daemon=True, name=f"{self.name}-accept").start()
 
     def stop(self):
         if self.sock:
@@ -956,7 +973,24 @@ class KcmServer:
                 conn, _ = self.sock.accept()
             except OSError:
                 return
-            threading.Thread(target=self.serve, args=(conn,), daemon=True, name="kcm-client").start()
+            threading.Thread(target=self.serve, args=(conn,), daemon=True, name=f"{self.name}-client").start()
+
+    def serve(self, conn):
+        raise NotImplementedError
+
+
+class KcmServer(UnixServer):
+    """Serves a KcmStore on a Unix socket.
+
+    need_ticket(client, cache_name) is called, on that connection's thread,
+    when an app asks for a cache without a valid TGT; the request waits until it
+    returns, so a ticket you sign in for answers the request that asked."""
+
+    name = "kcm"
+
+    def __init__(self, store, path=KCM_SOCKET, need_ticket=None, log=print):
+        super().__init__(path, log)
+        self.store, self.need_ticket = store, need_ticket
 
     @staticmethod
     def recv_exact(conn, n):
@@ -970,8 +1004,7 @@ class KcmServer:
 
     def serve(self, conn):
         with conn:
-            pid, uid, _ = struct.unpack("3i", conn.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED,
-                                                              struct.calcsize("3i")))
+            pid, uid = peer_of(conn)
             if uid != os.getuid():
                 return
             client = None
@@ -1060,26 +1093,339 @@ def session_kcm_enabled():
     return ENVIRONMENT_D.exists()
 
 
+def session_setup_current():
+    """False if the environment.d file predates the ntlm_auth helper (or is gone)."""
+    try:
+        return "PATH=" in ENVIRONMENT_D.read_text()
+    except OSError:
+        return False
+
+
+def session_path(with_helper):
+    """The session's PATH as the systemd user manager has it (or ours), with
+    Kerberus's helper directory first, or taken out (None if it isn't there)."""
+    current = os.environ.get("PATH", "")
+    if shutil.which("systemctl"):
+        proc = subprocess.run(["systemctl", "--user", "show-environment"], env=host_env(),
+                              capture_output=True, text=True, check=False)
+        for line in proc.stdout.splitlines() if proc.returncode == 0 else []:
+            if line.startswith("PATH="):
+                try:
+                    current = shlex.split(line)[0].partition("=")[2]
+                except ValueError:
+                    pass
+    parts = [d for d in current.split(":") if d]
+    if not with_helper and str(HELPER_DIR) not in parts:
+        return None
+    parts = [d for d in parts if d != str(HELPER_DIR)]
+    return ":".join([str(HELPER_DIR)] * with_helper + parts)
+
+
 def set_session_kcm(enabled):
-    """Make the session's apps use Kerberus's cache from the next login (environment.d),
-    and tell the running systemd user manager and D-Bus activation environment now."""
+    """Make the session's apps use Kerberus's cache (and its ntlm_auth) from the
+    next login (environment.d), and tell the running systemd user manager and
+    D-Bus activation environment now."""
     if enabled:
         write_kcm_config()
+        write_ntlm_helper()
         env = kcm_env()
         ENVIRONMENT_D.parent.mkdir(parents=True, exist_ok=True)
         ENVIRONMENT_D.write_text(
             "# Written by Kerberus (Preferences → Sign-In Prompts): Kerberos apps keep their\n"
-            "# tickets in Kerberus, which asks you to sign in when one needs a ticket.\n"
-            + "".join(f"{k}={v}\n" for k, v in env.items()))
-        assignments = [f"{k}={v}" for k, v in env.items()]
+            "# tickets in Kerberus, which asks you to sign in when one needs a ticket, and apps\n"
+            "# that do NTLM through Samba's ntlm_auth helper (Firefox) find Kerberus's instead.\n"
+            + "".join(f"{k}={v}\n" for k, v in env.items())
+            + f"PATH={HELPER_DIR}${{PATH:+:$PATH}}\n")
+        assignments = [f"{k}={v}" for k, v in env.items()] + [f"PATH={session_path(True)}"]
         commands = [["systemctl", "--user", "set-environment", *assignments],
                     ["dbus-update-activation-environment", *assignments]]
     else:
         ENVIRONMENT_D.unlink(missing_ok=True)
         commands = [["systemctl", "--user", "unset-environment", "KRB5CCNAME", "KRB5_CONFIG"]]
+        path = session_path(False)
+        if path is not None:
+            commands += [["systemctl", "--user", "set-environment", f"PATH={path}"],
+                         ["dbus-update-activation-environment", f"PATH={path}"]]
     for argv in commands:
         if shutil.which(argv[0]):
             subprocess.run(argv, env=host_env(), capture_output=True, check=False)
+
+
+# ---------------------------------------------------------------------------
+# NTLM, for apps that use Samba's ntlm_auth helper
+#
+# Windows sign-in ("Negotiate") falls back to NTLM when Kerberos doesn't work
+# out (no ticket to be had, a service without an SPN, a server that only
+# speaks NTLM), and browsers do NTLM by themselves: nothing goes through a
+# credential cache for Kerberus to see. Firefox is the exception: for sites in
+# network.automatic-ntlm-auth.trusted-uris it runs Samba's
+# `ntlm_auth --helper-protocol ntlmssp-client-1` from PATH and lets that do the
+# handshake (so that winbind's credentials get used), and only asks for a
+# password itself when that fails. Kerberus puts an ntlm_auth of its own first
+# in the session's PATH (environment.d, next to KRB5CCNAME). It relays the
+# helper protocol to the socket below, where Kerberus answers with NTLMv2
+# messages (MS-NLMP) for the identity you choose, asking just as it does for a
+# Kerberos ticket, and signing you in to Kerberos with the same password.
+#
+# The helper protocol is line based: "YR" asks for the NEGOTIATE message
+# ("YR <base64>"), "TT <base64 CHALLENGE>" gets the AUTHENTICATE message
+# ("AF <base64>"), and "BH <why>" says the helper can't.
+
+NTLM_SOCKET = RUNTIME_DIR / "ntlm.sock"
+HELPER_DIR = CONFIG_HOME / "kerberus" / "bin"
+NTLM_HELPER = HELPER_DIR / "ntlm_auth"
+NTLM_HELPER_SCRIPT = r'''#!/usr/bin/env python3
+"""Written by Kerberus. Stands in for Samba's ntlm_auth, as far as Firefox uses
+it: the ntlmssp-client-1 helper protocol is relayed to Kerberus, which does the
+NTLM handshake for the identity you choose. When Kerberus isn't serving, the
+real ntlm_auth (if there is one) gets the request instead."""
+import os
+import socket
+import sys
+
+
+def hand_over():
+    me = os.path.realpath(__file__)
+    for directory in os.environ.get("PATH", "").split(":"):
+        path = os.path.join(directory, "ntlm_auth")
+        if directory and os.path.realpath(path) != me and os.access(path, os.X_OK):
+            os.execv(path, [path] + sys.argv[1:])
+    sys.stdout.write("BH Kerberus isn't running\n")
+    sys.stdout.flush()
+    sys.exit(1)
+
+
+protocol = ""
+for i, arg in enumerate(sys.argv):
+    if arg.startswith("--helper-protocol="):
+        protocol = arg.partition("=")[2]
+    elif arg == "--helper-protocol" and i + 1 < len(sys.argv):
+        protocol = sys.argv[i + 1]
+if protocol != "ntlmssp-client-1":
+    hand_over()
+runtime = os.environ.get("XDG_RUNTIME_DIR") or "/tmp/kerberus-%d" % os.getuid()
+sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+try:
+    sock.connect(os.path.join(runtime, "kerberus", "ntlm.sock"))
+except OSError:
+    hand_over()
+replies = sock.makefile("rb")
+while True:
+    line = sys.stdin.buffer.readline()
+    if not line:
+        break
+    sock.sendall(line.rstrip(b"\r\n") + b"\n")
+    reply = replies.readline() or b"BH Kerberus went away\n"
+    sys.stdout.buffer.write(reply)
+    sys.stdout.buffer.flush()
+'''
+
+
+def write_ntlm_helper(path=NTLM_HELPER):
+    path = Path(path)
+    try:
+        if path.read_text() == NTLM_HELPER_SCRIPT and path.stat().st_mode & 0o111:
+            return
+    except OSError:
+        pass
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(NTLM_HELPER_SCRIPT)
+    os.chmod(tmp, 0o755)
+    os.replace(tmp, path)
+
+
+def md4(data):
+    """MD4 (RFC 1320); OpenSSL 3 no longer gives it to hashlib."""
+    def rotl(x, n):
+        return ((x << n) | (x >> (32 - n))) & 0xFFFFFFFF
+    a, b, c, d = 0x67452301, 0xEFCDAB89, 0x98BADCFE, 0x10325476
+    data = bytes(data)
+    msg = data + b"\x80" + b"\0" * ((55 - len(data)) % 64) + struct.pack("<Q", len(data) * 8)
+    for off in range(0, len(msg), 64):
+        x = struct.unpack("<16I", msg[off:off + 64])
+        aa, bb, cc, dd = a, b, c, d
+        for i in range(16):
+            f = (b & c) | (~b & d)
+            a, d, c, b = d, c, b, rotl((a + f + x[i]) & 0xFFFFFFFF, (3, 7, 11, 19)[i % 4])
+        for i in range(16):
+            g = (b & c) | (b & d) | (c & d)
+            a, d, c, b = d, c, b, rotl((a + g + x[(i % 4) * 4 + i // 4] + 0x5A827999) & 0xFFFFFFFF, (3, 5, 9, 13)[i % 4])
+        for i in range(16):
+            k = (0, 8, 4, 12, 2, 10, 6, 14, 1, 9, 5, 13, 3, 11, 7, 15)[i]
+            a, d, c, b = d, c, b, rotl((a + (b ^ c ^ d) + x[k] + 0x6ED9EBA1) & 0xFFFFFFFF, (3, 9, 11, 15)[i % 4])
+        a, b, c, d = (a + aa) & 0xFFFFFFFF, (b + bb) & 0xFFFFFFFF, (c + cc) & 0xFFFFFFFF, (d + dd) & 0xFFFFFFFF
+    return struct.pack("<4I", a, b, c, d)
+
+
+NTLMSSP = b"NTLMSSP\0"
+NTLM_UNICODE, NTLM_OEM, NTLM_REQUEST_TARGET, NTLM_NTLM, NTLM_ALWAYS_SIGN = 0x1, 0x2, 0x4, 0x200, 0x8000
+NTLM_EXTENDED_SESSION_SECURITY, NTLM_TARGET_INFO, NTLM_VERSION, NTLM_128, NTLM_56 = (
+    0x80000, 0x800000, 0x2000000, 0x20000000, 0x80000000)
+NTLM_NEGOTIATE_FLAGS = (NTLM_UNICODE | NTLM_OEM | NTLM_REQUEST_TARGET | NTLM_NTLM | NTLM_ALWAYS_SIGN
+                        | NTLM_EXTENDED_SESSION_SECURITY | NTLM_VERSION | NTLM_128 | NTLM_56)
+NTLM_VERSION_FIELD = struct.pack("<BBHxxxB", 10, 0, 19041, 15)  # Windows 10, NTLMSSP revision 15
+AV_EOL, AV_FLAGS, AV_TIMESTAMP = 0, 6, 7
+AV_MIC_PRESENT = 0x2
+
+
+def hmac_md5(key, data):
+    return hmac.new(key, data, hashlib.md5).digest()
+
+
+def utf16(text):
+    return text.encode("utf-16-le")
+
+
+def filetime(t):
+    """Windows FILETIME (100 ns since 1601) of a Unix time."""
+    return struct.pack("<Q", int((t + 11644473600) * 10_000_000))
+
+
+def ntowf_v2(user, domain, password):
+    """The NTLMv2 response key: HMAC-MD5 of the NT hash over the upper-cased user and the domain."""
+    return hmac_md5(md4(utf16(password)), utf16(user.upper() + domain))
+
+
+def ntlm_fields(offset, *items):
+    """(length, maximum length, offset) headers for payload items laid out from offset, and the payload."""
+    heads, body = b"", b""
+    for item in items:
+        heads += struct.pack("<HHI", len(item), len(item), offset + len(body))
+        body += item
+    return heads, body
+
+
+def ntlm_negotiate(flags=NTLM_NEGOTIATE_FLAGS):
+    """The NEGOTIATE message (type 1): no domain or workstation, a version."""
+    heads, body = ntlm_fields(40, b"", b"")
+    return NTLMSSP + struct.pack("<II", 1, flags) + heads + NTLM_VERSION_FIELD + body
+
+
+class NtlmChallenge:
+    """A CHALLENGE message (type 2) from the server."""
+
+    def __init__(self, raw):
+        if len(raw) < 48 or raw[:8] != NTLMSSP or struct.unpack_from("<I", raw, 8)[0] != 2:
+            raise ValueError("not an NTLM challenge")
+        self.raw = raw
+        name_len, _, name_off = struct.unpack_from("<HHI", raw, 12)
+        self.flags, = struct.unpack_from("<I", raw, 20)
+        self.server_challenge = raw[24:32]
+        info_len, _, info_off = struct.unpack_from("<HHI", raw, 40)
+        self.target_name = raw[name_off:name_off + name_len].decode("utf-16-le", "replace") \
+            if self.flags & NTLM_UNICODE else raw[name_off:name_off + name_len].decode("ascii", "replace")
+        info = raw[info_off:info_off + info_len] if self.flags & NTLM_TARGET_INFO else b""
+        self.pairs = []  # (id, value) AV pairs, without the terminator
+        pos = 0
+        while pos + 4 <= len(info):
+            av_id, av_len = struct.unpack_from("<HH", info, pos)
+            if av_id == AV_EOL:
+                break
+            self.pairs.append((av_id, info[pos + 4:pos + 4 + av_len]))
+            pos += 4 + av_len
+
+    def timestamp(self):
+        return next((v for i, v in self.pairs if i == AV_TIMESTAMP and len(v) == 8), None)
+
+
+def ntlm_authenticate(negotiate, challenge, user, domain, password, workstation="", client_challenge=None, now=None):
+    """The AUTHENTICATE message (type 3) with an NTLMv2 response and a MIC, and the session key.
+
+    No key exchange is negotiated (the session key is the one NTLMv2 derives), so
+    there's no encrypted random session key; signing and sealing aren't asked for,
+    which HTTP doesn't use."""
+    client_challenge = client_challenge or secrets.token_bytes(8)
+    key = ntowf_v2(user, domain, password)
+    pairs, has_flags = [], False
+    for av_id, value in challenge.pairs:  # the server's target info, saying a MIC is present
+        if av_id == AV_FLAGS and len(value) == 4:
+            value, has_flags = struct.pack("<I", struct.unpack("<I", value)[0] | AV_MIC_PRESENT), True
+        pairs.append((av_id, value))
+    if not has_flags:
+        pairs.append((AV_FLAGS, struct.pack("<I", AV_MIC_PRESENT)))
+    target_info = b"".join(struct.pack("<HH", i, len(v)) + v for i, v in pairs) + struct.pack("<HH", AV_EOL, 0)
+    stamp = challenge.timestamp() or filetime(time.time() if now is None else now)
+    temp = b"\x01\x01" + b"\0" * 6 + stamp + client_challenge + b"\0" * 4 + target_info + b"\0" * 4
+    proof = hmac_md5(key, challenge.server_challenge + temp)
+    # With a server timestamp the LM response is left empty (MS-NLMP 3.1.5.1.2).
+    lm_response = b"\0" * 24 if challenge.timestamp() else (
+        hmac_md5(key, challenge.server_challenge + client_challenge) + client_challenge)
+    session_key = hmac_md5(key, proof)
+    flags = (NTLM_UNICODE | NTLM_REQUEST_TARGET | NTLM_NTLM | NTLM_ALWAYS_SIGN | NTLM_VERSION
+             | challenge.flags & (NTLM_TARGET_INFO | NTLM_EXTENDED_SESSION_SECURITY | NTLM_128 | NTLM_56))
+    heads, body = ntlm_fields(88, lm_response, proof + temp, utf16(domain), utf16(user), utf16(workstation), b"")
+    head = NTLMSSP + struct.pack("<I", 3) + heads + struct.pack("<I", flags) + NTLM_VERSION_FIELD
+    mic = hmac_md5(session_key, negotiate + challenge.raw + head + b"\0" * 16 + body)
+    return head + mic + body, session_key
+
+
+def ntlm_identity(principal, domain=""):
+    """The (user, domain) to sign in to Windows as: alice@CORP.EXAMPLE.COM is
+    CORP\\alice, unless the domain is given."""
+    user, at, realm = principal.rpartition("@")
+    if not at:
+        user, realm = principal, ""
+    return user, domain or realm.partition(".")[0]
+
+
+def workstation_name():
+    return socket.gethostname().partition(".")[0].upper()[:15]
+
+
+class NtlmServer(UnixServer):
+    """Answers the ntlm_auth helper protocol (relayed by Kerberus's ntlm_auth).
+
+    credentials(client) returns (user, domain, password) for the app that ran
+    the helper, or None. Like KcmServer.need_ticket, it runs on the connection's
+    thread and may wait for you to sign in; the app waits meanwhile."""
+
+    name = "ntlm"
+
+    def __init__(self, credentials, path=NTLM_SOCKET, log=print):
+        super().__init__(path, log)
+        self.credentials = credentials
+
+    def serve(self, conn):
+        with conn:
+            pid, uid = peer_of(conn)
+            if uid != os.getuid():
+                return
+            client = KcmClient.from_pid(parent_pid(pid) or pid)  # the helper's parent is the app
+            negotiate = None
+            try:
+                for line in conn.makefile("rb"):
+                    command, _, argument = line.decode("ascii", "replace").strip().partition(" ")
+                    if DEBUG:
+                        self.log(f"ntlm: {client.program}[{client.pid}] {command}")
+                    try:
+                        reply = self.answer(client, command, argument.strip(), negotiate)
+                        if command == "YR":
+                            negotiate = base64.b64decode(reply[3:])
+                    except (ValueError, binascii.Error, struct.error) as e:
+                        reply = f"BH {e}"
+                    conn.sendall(reply.encode() + b"\n")
+            except (ConnectionError, OSError):
+                return
+
+    def answer(self, client, command, argument, negotiate):
+        if command == "YR":
+            return "YR " + base64.b64encode(ntlm_negotiate()).decode()
+        if command == "TT":
+            if negotiate is None:
+                return "BH no NEGOTIATE yet"
+            challenge = NtlmChallenge(base64.b64decode(argument))
+            found = self.credentials(client)
+            if not found:
+                self.log(f"ntlm: no credentials for {client.program} (server {challenge.target_name or '?'})")
+                return "BH no credentials"
+            user, domain, password = found
+            message, _ = ntlm_authenticate(negotiate, challenge, user, domain, password, workstation_name())
+            self.log(f"ntlm: {client.program} signs in to {challenge.target_name or '?'} as {domain}\\{user}")
+            return "AF " + base64.b64encode(message).decode()
+        if command in ("PW", "SF"):  # a password or flags: Kerberus has its own
+            return "OK"
+        return "BH unknown command"
 
 
 # ---------------------------------------------------------------------------
@@ -1186,13 +1532,27 @@ def cli(args):
                         ok = recover_quietly(principal, cache, settings, keyring, failed)
                         print(f"{client.program} needs a ticket for {principal}: "
                               + ("got one" if ok else "sign in with the window or kerberus get"), flush=True)
+
+            def ntlm_credentials(client):
+                principal = store.describe(None)[0] or settings["last_principal"]
+                password = keyring.lookup(principal) if principal and principal not in failed else None
+                if password is None:
+                    print(f"{client.program} wants to sign in with NTLM: no saved password"
+                          + (f" for {principal}" if principal else ""), flush=True)
+                    return None
+                return (*ntlm_identity(principal, settings["ntlm_domain"]), password)
+
             server = KcmServer(store, need_ticket=need_ticket, log=lambda m: print(m, flush=True))
             try:
                 server.start()
+                if settings["ntlm"]:
+                    write_ntlm_helper()
+                    NtlmServer(ntlm_credentials, log=lambda m: print(m, flush=True)).start()
             except (RuntimeError, OSError) as e:
                 print(f"Can't serve the credential cache: {e}", file=sys.stderr)
                 return 1
-            print(f"Serving the KCM credential cache on {KCM_SOCKET}.", flush=True)
+            print(f"Serving the KCM credential cache on {KCM_SOCKET}"
+                  + (f" and NTLM sign-ins on {NTLM_SOCKET}." if settings["ntlm"] else "."), flush=True)
         print(f"Watching tickets every {args.interval} s (renew {settings['renew_before']} min ahead).", flush=True)
         while True:
             notices = maintain(list_caches(), settings, keyring, log=lambda m: print(m, flush=True), failed=failed)
@@ -1274,11 +1634,14 @@ def gui(background=False, smoke_test=False):
 
     @dataclass
     class PromptRequest:
-        """An app waiting (on a KCM connection thread) for you to sign in."""
+        """An app waiting (on a KCM or NTLM connection thread) for you to sign in."""
         client: KcmClient
         principal: str
         cache: str
+        kind: str = "ticket"      # or "ntlm": the app wants an NTLM sign-in, not a ticket
         done: threading.Event = field(default_factory=threading.Event)
+        signed_in_as: str = ""    # filled in when you sign in: the identity and its password
+        password: str | None = None
 
     def app_info_for(program):
         """The installed app (desktop file) whose executable is `program`."""
@@ -1308,6 +1671,7 @@ def gui(background=False, smoke_test=False):
             self.told = set()         # notifications already sent
             self.store = None         # the KCM caches, when Kerberus is the credential cache
             self.server = None
+            self.ntlm = None          # the NTLM helper server, with it
             self.kcm_error = None
             self.prompt = None        # the PromptRequest being answered
             self.prompt_lock = threading.Lock()
@@ -1392,6 +1756,8 @@ def gui(background=False, smoke_test=False):
 
         def start_kcm(self):
             use_kcm(True)
+            if session_kcm_enabled() and not session_setup_current():
+                set_session_kcm(True)  # an older Kerberus set the session up: add the ntlm_auth helper
             self.store = KcmStore(KCM_STATE)
             self.store.changed = lambda: GLib.idle_add(self.queue_refresh)
             self.server = KcmServer(self.store, need_ticket=self.need_ticket,
@@ -1402,8 +1768,33 @@ def gui(background=False, smoke_test=False):
             except (RuntimeError, OSError) as e:
                 self.server = None
                 self.kcm_error = f"Kerberus can't keep the tickets for apps: {e}"
+                return
+            if self.settings["ntlm"]:
+                self.start_ntlm()
+
+        def start_ntlm(self):
+            try:
+                write_ntlm_helper()
+                self.ntlm = NtlmServer(self.ntlm_credentials, log=lambda m: print(m, file=sys.stderr))
+                self.ntlm.start()
+            except (RuntimeError, OSError) as e:
+                self.ntlm = None
+                print(f"Kerberus can't answer NTLM sign-ins: {e}", file=sys.stderr)
+
+        def stop_ntlm(self):
+            if self.ntlm:
+                self.ntlm.stop()
+            self.ntlm = None
+
+        def set_ntlm(self, enabled):
+            self.set_setting("ntlm", enabled)
+            if enabled and self.server and not self.ntlm:
+                self.start_ntlm()
+            elif not enabled:
+                self.stop_ntlm()
 
         def stop_kcm(self):
+            self.stop_ntlm()
             if self.server:
                 self.server.stop()
             self.server = self.store = None
@@ -1443,6 +1834,28 @@ def gui(background=False, smoke_test=False):
             answered = request.done.wait(settings["prompt_timeout"])
             if DEBUG:
                 print(f"prompt: {client.program}[{client.pid}] {'answered' if answered else 'timed out'}", file=sys.stderr)
+
+        def ntlm_credentials(self, client):
+            """An app's ntlm_auth helper has a challenge to answer. Runs on the
+            NTLM connection's thread; the app waits until this returns."""
+            settings = self.settings
+            if client.program in settings["ignored_apps"] or time.time() < self.snoozed.get(client.program, 0):
+                return None
+            principal = (self.store.describe(None)[0] if self.store else "") or settings["last_principal"]
+            password = self.keyring.lookup(principal) if principal and principal not in self.failed else None
+            if password is None:
+                with self.prompt_lock:
+                    request = self.prompt
+                    if request is None:
+                        request = self.prompt = PromptRequest(client, principal, "", kind="ntlm")
+                        GLib.idle_add(self.show_prompt, request)
+                if DEBUG:
+                    print(f"ntlm: {client.program}[{client.pid}] waits for {id(request):x}", file=sys.stderr)
+                request.done.wait(settings["prompt_timeout"])
+                principal, password = request.signed_in_as, request.password
+            if not password:
+                return None
+            return (*ntlm_identity(principal, settings["ntlm_domain"]), password)
 
         def show_prompt(self, request):
             if self.picker:
@@ -1606,6 +2019,7 @@ def gui(background=False, smoke_test=False):
                             f"{Adw.get_micro_version()}, GTK {Gtk.get_major_version()}.{Gtk.get_minor_version()}."
                             f"{Gtk.get_micro_version()}\nKRB5CCNAME={os.environ.get('KRB5CCNAME', '')}\n"
                             f"Credential cache server: {KCM_SOCKET if self.server else 'off'}\n"
+                           f"NTLM helper: {NTLM_SOCKET if self.ntlm else 'off'}\n"
                             f"Tray: {'registered' if self.tray and self.tray.registered else 'no StatusNotifierWatcher'}\n"
                             f"Keyring: {'yes' if self.keyring.available else 'no'}"))
             about.present(self.window)
@@ -2176,8 +2590,10 @@ def gui(background=False, smoke_test=False):
                 else:
                     self.app_icon.set_from_icon_name(APP_ID)
                 self.heading.set_text(f"{name} Wants to Sign In")
-                self.subheading.set_text(f"{name} needs a Kerberos ticket and is waiting for you to choose "
-                                         "who to sign in as.")
+                self.subheading.set_text(
+                    f"{name} is signing in to a Windows server with NTLM and is waiting for you to choose "
+                    "who to sign in as." if self.request.kind == "ntlm" else
+                    f"{name} needs a Kerberos ticket and is waiting for you to choose who to sign in as.")
                 self.dont_ask.set_title(f"Don't Ask for {name} Again")
                 self.dont_ask.set_visible(True)
             else:
@@ -2280,7 +2696,8 @@ def gui(background=False, smoke_test=False):
             remember = self.remember_row.get_active() and self.app.keyring.available
             was_saved = principal in self.app.saved
             # Sign in to the cache the waiting app asked for, so its request finds the ticket.
-            cache = f"KCM:{self.request.cache}" if self.request and self.app.server else None
+            request = self.request
+            cache = f"KCM:{request.cache}" if request and request.cache and self.app.server else None
             settings, keyring = dict(self.app.settings), self.app.keyring
             self.set_busy(True)
             self.banner.set_revealed(False)
@@ -2292,6 +2709,8 @@ def gui(background=False, smoke_test=False):
                 result = get_ticket(principal, secret, cache=cache, **ticket_options(settings))
                 if result.ok and cache:
                     run_tool("kswitch", "-c", cache)
+                if result.ok and request:  # an NTLM sign-in uses the same password
+                    request.signed_in_as, request.password = principal, secret
                 if result.ok and password is not None:
                     if remember:
                         error = keyring.store(principal, password)
@@ -2582,6 +3001,14 @@ def gui(background=False, smoke_test=False):
             prompts.add(self.kcm_row)
             timeout = self.spin("prompt_timeout", "Apps Wait For", "Seconds before an app gives up waiting", 15, 600, 15)
             prompts.add(timeout)
+            self.ntlm_row = Adw.SwitchRow(title="Answer NTLM Sign-Ins", active=app.settings["ntlm"],
+                                          subtitle="For Firefox and other apps that use Samba's ntlm_auth helper")
+            self.ntlm_row.connect("notify::active", lambda row, _p: self.app.set_ntlm(row.get_active()))
+            prompts.add(self.ntlm_row)
+            self.domain_row = Adw.EntryRow(title="Windows Domain for NTLM (blank: the first part of the realm)", text=app.settings["ntlm_domain"],
+                                           show_apply_button=True)
+            self.domain_row.connect("apply", lambda row: self.app.set_setting("ntlm_domain", row.get_text().strip()))
+            prompts.add(self.domain_row)
             self.ignored = Adw.ExpanderRow(title="Apps That Never Ask", use_markup=False)
             prompts.add(self.ignored)
             self.ignored_rows = []

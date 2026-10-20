@@ -17,7 +17,9 @@ Kerberus drives the MIT Kerberos tools (`kinit`, `klist`, `kdestroy`, `kswitch`,
 `kpasswd`), so it uses the machine's own `krb5.conf` and credential caches
 (`FILE:`, `DIR:`, `KEYRING:` or `KCM:`): tickets it gets are the ones every other
 program sees. The AppImage also carries its own copies of the tools, used when the
-host has none.
+host has none. It also answers NTLM sign-ins for Firefox (and anything else that
+uses Samba's `ntlm_auth` helper), with the same identities and prompts, so Windows
+servers that fall back from Kerberos to NTLM work without winbind.
 
 ## Install
 
@@ -75,15 +77,64 @@ Things to know:
   `network.negotiate-auth.trusted-uris` in Firefox's `about:config` (for example
   `.example.com`), or the `AuthServerAllowlist` policy in Chrome and Chromium.
 - **NTLM.** Windows sign-in ("Negotiate") uses Kerberos when there's a ticket
-  and falls back to NTLM when there isn't. Kerberus sees and answers the
-  Kerberos attempt, which is what makes the fallback unnecessary. Apps that do
-  NTLM by themselves (Firefox's and Chrome's built-in NTLM, with their own
-  password dialogs) never go through anything Kerberus can see, so it can't
-  prompt for those.
+  and falls back to NTLM when there isn't, and browsers do NTLM by themselves,
+  with their own password dialogs, so nothing of it reaches a credential
+  cache. Firefox is the exception, and Kerberus answers for it; see
+  [NTLM](#ntlm). Chrome's and Chromium's NTLM has no such hook, so they keep
+  asking with their own dialog.
 - **Flatpak and Snap apps** don't see the session's Kerberos settings, so they
   aren't covered.
 - `KERBERUS_DEBUG=1 kerberus` logs every request apps make, with the program
   that made it.
+
+## NTLM
+
+For sites in `network.automatic-ntlm-auth.trusted-uris`, Firefox doesn't do NTLM
+itself: it runs Samba's `ntlm_auth --helper-protocol ntlmssp-client-1` from `PATH`
+and lets it do the handshake, meant for machines joined to a domain with winbind.
+With sign-in prompts on, Kerberus puts an `ntlm_auth` of its own first in the
+session's `PATH` (the same `60-kerberus.conf`; `~/.config/kerberus/bin/ntlm_auth`,
+a small Python script) which relays the helper protocol to Kerberus. Kerberus
+answers with NTLMv2 messages (MS-NLMP, with a MIC) for one of your identities:
+
+- without asking, when the identity your tickets belong to (or the last one you
+  signed in as) has its password saved in the keyring;
+- otherwise the sign-in window opens, naming the app and saying it's an NTLM
+  sign-in. Choosing an identity and typing its password gets a Kerberos ticket
+  with it, as usual, and answers the NTLM request with the same password.
+  Cancelling makes the helper fail, and Firefox falls back to its own dialog.
+
+The identity `alice@CORP.EXAMPLE.COM` signs in as `CORP\alice`: the Windows domain
+is the first part of the realm unless *Preferences → Windows Domain for NTLM*
+says otherwise. Turn it off with *Answer NTLM Sign-Ins*. Firefox waits for the
+helper's answer, so it sits still while the window is open (for *Apps Wait For*
+at most). When Kerberus isn't running, its `ntlm_auth` hands the request to the
+real one if the machine has it. Thunderbird (the same networking code) uses it
+too; curl, Chrome and GNOME's own apps don't go through `ntlm_auth` on `PATH`.
+
+## AD FS
+
+AD FS does Windows Integrated Authentication (Kerberos, then NTLM) for browsers it
+recognises and shows its sign-in form to everyone else, and it decides by the
+browser's `User-Agent` header (`WIASupportedUserAgents`; by default Internet
+Explorer, Edge and Windows-only strings, so a Linux browser gets the form). That
+decision is made on the server from the header the browser sends, so no
+credential-cache or helper on your machine can change it. What Kerberus covers
+is everything after AD FS has offered WIA: it gets the ticket for
+`HTTP/adfs.example.com` (prompting if need be), and if Kerberos doesn't work out
+(no SPN, or the ticket is refused) and AD FS answers `NTLM`, Firefox's NTLM
+fallback is answered as above.
+
+To be offered WIA from Linux without touching AD FS, the browser has to send a
+`User-Agent` on the list for that host. Firefox has no per-site override any more
+(the site-specific `general.useragent.override.<host>` prefs were dropped) and
+Chrome never had one, so that takes a user-agent switcher extension with a rule
+for the AD FS host (a Windows Firefox or Chrome string), or Firefox's global
+`general.useragent.override`. Then add the AD FS host to
+`network.negotiate-auth.trusted-uris` and `network.automatic-ntlm-auth.trusted-uris`
+(Firefox) or `AuthServerAllowlist` (Chrome) and sign in once in Kerberus. AD FS's
+*Extended Protection* has to be at its default (*Allow*): with *Require* it insists
+on channel bindings, which the `ntlm_auth` helper protocol has no way to carry.
 
 ## Using it
 
@@ -129,7 +180,8 @@ kerberus passwd [PRINCIPAL]
 kerberus destroy [PRINCIPAL | --all]
 kerberus forget PRINCIPAL               remove a saved password
 kerberus watch [--once]                 renew in the foreground (e.g. a systemd user service)
-kerberus watch --kcm                    ... and be the credential cache, without prompts
+kerberus watch --kcm                    ... and be the credential cache (and answer NTLM
+                                        with saved passwords), without prompts
 kerberus --background                   start hidden and keep renewing
 ```
 
@@ -165,7 +217,8 @@ Markdown files and `LICENSE` alone don't start a build. The first release is 0.1
 
 Everything is in [`kerberus.py`](kerberus.py): the Kerberos tool wrappers and
 `klist` parsing, the renewal logic shared by the window and `kerberus watch`, the
-KCM server (the protocol MIT's `cc_kcm.c` speaks), the CLI, and the GUI with its
+KCM server (the protocol MIT's `cc_kcm.c` speaks), the NTLM server (NTLMv2 and
+the `ntlm_auth` helper protocol), the CLI, and the GUI with its
 sign-in window and tray icon (a StatusNotifierItem with a `com.canonical.dbusmenu`
 menu, over GDBus). Run it from a checkout with the distro's PyGObject, GTK 4,
 libadwaita (1.5 or newer) and libsecret typelibs installed:
@@ -183,7 +236,11 @@ The tests run `krb5kdc` and `kadmind` as your user on ports 18888–18890
 ([`tests/kdc.sh`](tests/kdc.sh)), so they don't touch `/etc/krb5.conf` or your
 tickets. The prompt test plays an app with a renamed copy of `kvno`, answers the
 sign-in window from the keyboard, and reads the tray icon through a stand-in tray
-host ([`tests/fake_tray_host.py`](tests/fake_tray_host.py)).
+host ([`tests/fake_tray_host.py`](tests/fake_tray_host.py)); then it plays
+Firefox doing NTLM through the `ntlm_auth` helper
+([`tests/ntlm_client.py`](tests/ntlm_client.py), which also checks the answer the
+way the server would). The unit tests check the NTLM messages against MS-NLMP's
+vectors; they were also checked against pyspnego acting as the server.
 
 ### Building the AppImage
 

@@ -8,6 +8,8 @@
 #   tests/prompt_e2e.sh python3 kerberus.py
 #   tests/prompt_e2e.sh ./dist/Kerberus-1.2.3-x86_64.AppImage --appimage-extract-and-run
 #
+# Then ntlm_client.py plays Firefox doing NTLM through the ntlm_auth helper that
+# Kerberus wrote, and the prompt is answered the same way.
 # Needs Xvfb, xdotool, dbus-x11 and python3-gi as well as the KDC packages.
 set -euo pipefail
 [ $# -gt 0 ] || { echo "usage: $0 COMMAND..." >&2; exit 2; }
@@ -65,6 +67,21 @@ check      "the app got its ticket"       "kvno = 1.*exit=0"          eval 'wait
 check      "and it's in the cache"        "Default principal: alice@$realm" klist
 sleep 1
 check      "tray shows the ticket"        "alice@$realm: [0-9]+ h"    tray
+
+helper=$work/config/kerberus/bin/ntlm_auth
+check      "ntlm_auth helper written"     "Written by Kerberus"       head -3 "$helper"
+rm -f "$work/ntlm.log"
+("${PYTHON:-python3}" "$here/ntlm_client.py" "$helper" alice-password 60 > "$work/ntlm.log.tmp" 2>&1 || true
+ mv "$work/ntlm.log.tmp" "$work/ntlm.log") &
+sleep 3
+check      "tray asks again, for NTLM"    '"status": "NeedsAttention".*python3.* is waiting' tray
+picker
+xdotool key Return                          # alice again: no saved password, so the password page
+sleep 1
+xdotool type --delay 30 alice-password
+xdotool key Return
+for _ in $(seq 60); do [ -e "$work/ntlm.log" ] && break; sleep 0.25; done
+check      "NTLM answered for alice"      "ntlm ok as KERBERUS.alice" cat "$work/ntlm.log"
 
 kdestroy -A
 someapp

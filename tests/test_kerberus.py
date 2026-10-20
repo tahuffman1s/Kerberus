@@ -1,13 +1,17 @@
 """Unit tests for the parts of Kerberus that don't need a KDC: klist parsing,
 renewal decisions and message cleanup. tests/integration.sh covers the rest."""
 
+import base64
 import datetime as dt
 import importlib.util
+import os
+import shlex
 import socket
 import struct
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -16,6 +20,8 @@ spec = importlib.util.spec_from_file_location("kerberus", Path(__file__).resolve
 kerberus = importlib.util.module_from_spec(spec)
 sys.modules["kerberus"] = kerberus
 spec.loader.exec_module(kerberus)
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import ntlm_client  # noqa: E402  (the verifier shared with prompt_e2e.sh)
 
 KLIST = """\
 Ticket cache: DIR::/tmp/krbdir/tkt
@@ -328,6 +334,224 @@ class KcmStoreTests(unittest.TestCase):
         self.assertFalse(kerberus.others_can_replace(st(0, 0o41777), uid=1000))     # /tmp: sticky
         self.assertFalse(kerberus.others_can_replace(st(0, 0o40755), uid=1000))     # nobody else writes
         self.assertTrue(kerberus.others_can_replace(st(1001, 0o40777), uid=1000))   # someone else's, open
+
+
+class NtlmTests(unittest.TestCase):
+    PASSWORD = "Sup3r secret pässword"
+
+    def test_md4(self):  # RFC 1320
+        for text, digest in [(b"", "31d6cfe0d16ae931b73c59d7e0c089c0"), (b"a", "bde52cb31de33e46245e05fbdbd6fb24"),
+                             (b"abc", "a448017aaf21d8525fc10ae87aa6729d"),
+                             (b"message digest", "d9130a8164549fe818874806e1c7014b"),
+                             (b"12345678901234567890" * 4, "e33b4ddc9c38f2199c3e7b164fcc0536")]:
+            self.assertEqual(kerberus.md4(text).hex(), digest)
+
+    def test_ntlmv2_vectors(self):
+        # NTOWFv2 from MS-NLMP 4.2.4; the responses as pyspnego computes them for the same inputs.
+        key = kerberus.ntowf_v2("User", "Domain", "Password")
+        self.assertEqual(key.hex(), "0c868a403bfd7a93a3001ef22ef02e3f")
+        info = bytes.fromhex("02000c0044006f006d00610069006e0001000c0053006500720076006500720000000000")
+        raw = (kerberus.NTLMSSP + struct.pack("<I", 2) + struct.pack("<HHI", 0, 0, 56) + struct.pack("<I", 0xE2898233)
+               + bytes.fromhex("0102030405060708") + b"\0" * 8 + struct.pack("<HHI", len(info), len(info), 56)
+               + kerberus.NTLM_VERSION_FIELD + info)
+        challenge = kerberus.NtlmChallenge(raw)
+        self.assertEqual(challenge.server_challenge.hex(), "0102030405060708")
+        self.assertEqual([(i, v.decode("utf-16-le")) for i, v in challenge.pairs], [(2, "Domain"), (1, "Server")])
+        self.assertIsNone(challenge.timestamp())
+        client_challenge = bytes.fromhex("aa" * 8)
+        temp = b"\x01\x01" + b"\0" * 14 + client_challenge + b"\0" * 4 + info + b"\0" * 4
+        self.assertEqual(kerberus.hmac_md5(key, challenge.server_challenge + temp).hex(),
+                         "3039a27dc6bda1b5901152cecf281414")
+        self.assertEqual(kerberus.hmac_md5(key, challenge.server_challenge + client_challenge).hex(),
+                         "4c645bba618a1840d1f8de1fac7dc1e4")
+        # The message itself: no server timestamp, so the LMv2 response is sent.
+        negotiate = kerberus.ntlm_negotiate()
+        message, session_key = kerberus.ntlm_authenticate(negotiate, challenge, "User", "Domain", "Password",
+                                                           "PC", client_challenge, now=-11644473600)
+        self.assertEqual(ntlm_client.field(message, 12).hex(), "4c645bba618a1840d1f8de1fac7dc1e4" + "aa" * 8)
+        self.assertEqual(ntlm_client.verify(negotiate, raw, message, "Password"), ("User", "Domain"))
+        self.assertEqual(session_key, kerberus.hmac_md5(key, ntlm_client.field(message, 20)[:16]))
+
+    def test_negotiate_message(self):
+        message = kerberus.ntlm_negotiate()
+        self.assertEqual(len(message), 40)
+        self.assertEqual(message[:12], b"NTLMSSP\0\x01\0\0\0")
+        flags, = struct.unpack_from("<I", message, 12)
+        self.assertTrue(flags & kerberus.NTLM_UNICODE and flags & kerberus.NTLM_NTLM
+                        and flags & kerberus.NTLM_EXTENDED_SESSION_SECURITY and flags & kerberus.NTLM_VERSION)
+
+    def test_authenticate_like_a_server(self):
+        negotiate = kerberus.ntlm_negotiate()
+        raw = ntlm_client.make_challenge(target="ADFS1", domain="CORP")
+        challenge = kerberus.NtlmChallenge(raw)
+        self.assertEqual(challenge.target_name, "ADFS1")
+        self.assertIsNotNone(challenge.timestamp())
+        message, _ = kerberus.ntlm_authenticate(negotiate, challenge, "alice", "CORP", self.PASSWORD, "MYPC")
+        self.assertEqual(ntlm_client.field(message, 12), b"\0" * 24)  # a timestamp: no LM response
+        self.assertEqual(ntlm_client.field(message, 44).decode("utf-16-le"), "MYPC")
+        self.assertEqual(ntlm_client.field(message, 52), b"")  # no key exchange
+        self.assertEqual(ntlm_client.verify(negotiate, raw, message, self.PASSWORD), ("alice", "CORP"))
+        with self.assertRaisesRegex(AssertionError, "proof"):
+            ntlm_client.verify(negotiate, raw, message, "wrong")
+        with self.assertRaisesRegex(AssertionError, "MIC"):
+            ntlm_client.verify(negotiate, raw, message[:72] + bytes(16) + message[88:], self.PASSWORD)
+        with self.assertRaises(ValueError):
+            kerberus.NtlmChallenge(negotiate)
+
+    def test_identity(self):
+        self.assertEqual(kerberus.ntlm_identity("alice@CORP.EXAMPLE.COM"), ("alice", "CORP"))
+        self.assertEqual(kerberus.ntlm_identity("alice@CORP.EXAMPLE.COM", "EXAMPLE"), ("alice", "EXAMPLE"))
+        self.assertEqual(kerberus.ntlm_identity("bob"), ("bob", ""))
+        self.assertEqual(kerberus.ntlm_identity("svc/host@R"), ("svc/host", "R"))
+
+
+class NtlmHelperTests(unittest.TestCase):
+    """The ntlm_auth helper Kerberus writes, talking to its server over the socket."""
+
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.runtime = Path(self.dir.name) / "run"
+        self.runtime.mkdir(mode=0o700)
+        self.helper = Path(self.dir.name) / "bin" / "ntlm_auth"
+        kerberus.write_ntlm_helper(self.helper)
+        self.asked = []
+        self.server = None
+
+    def tearDown(self):
+        if self.server:
+            self.server.stop()
+        self.dir.cleanup()
+
+    def serve(self, credentials):
+        self.server = kerberus.NtlmServer(credentials, self.runtime / "kerberus" / "ntlm.sock", log=lambda m: None)
+        self.server.start()
+
+    def env(self, path=""):
+        return dict(os.environ, XDG_RUNTIME_DIR=str(self.runtime), PATH=path or os.environ.get("PATH", ""))
+
+    def test_helper_is_written_once(self):
+        before = self.helper.stat()
+        self.assertTrue(before.st_mode & 0o111)
+        kerberus.write_ntlm_helper(self.helper)
+        self.assertEqual(self.helper.stat().st_mtime_ns, before.st_mtime_ns)
+        self.assertEqual(self.helper.read_text(), kerberus.NTLM_HELPER_SCRIPT)
+
+    def test_firefox_exchange(self):
+        def credentials(client):
+            self.asked.append(client.program)
+            return "alice", "CORP", NtlmTests.PASSWORD
+        self.serve(credentials)
+        os.environ["XDG_RUNTIME_DIR"] = str(self.runtime)  # for ntlm_client.talk's subprocess
+        try:
+            outcome = ntlm_client.talk(self.helper, NtlmTests.PASSWORD, timeout=10)
+        finally:
+            os.environ.pop("XDG_RUNTIME_DIR", None)
+        self.assertEqual(outcome, "ntlm ok as CORP\\alice")
+        self.assertTrue(self.asked and self.asked[0].startswith("python"), self.asked)  # the helper's parent
+
+    def test_no_credentials_and_bad_input(self):
+        self.serve(lambda client: None)
+        challenge = base64.b64encode(ntlm_client.make_challenge()).decode()
+        proc = subprocess.run([str(self.helper), "--helper-protocol", "ntlmssp-client-1"], env=self.env(),
+                              input=f"TT {challenge}\nYR\nTT {challenge}\nTT nonsense!\nXX\nPW secret\n",
+                              capture_output=True, text=True, timeout=20)
+        lines = proc.stdout.splitlines()
+        self.assertEqual(lines[0], "BH no NEGOTIATE yet")
+        self.assertTrue(lines[1].startswith("YR "), lines)
+        self.assertEqual(lines[2], "BH no credentials")
+        self.assertTrue(lines[3].startswith("BH "), lines)
+        self.assertEqual(lines[4:], ["BH unknown command", "OK"])
+
+    def test_hands_over_without_kerberus(self):
+        real = Path(self.dir.name) / "real" / "ntlm_auth"
+        real.parent.mkdir()
+        real.write_text("#!/bin/sh\necho \"REAL $*\"\n")
+        real.chmod(0o755)
+        path = f"{self.helper.parent}:{real.parent}:{os.environ.get('PATH', '')}"
+        proc = subprocess.run(["ntlm_auth", "--helper-protocol=ntlmssp-client-1", "--username", "u"],
+                              env=self.env(path), input="YR\n", capture_output=True, text=True, timeout=20)
+        self.assertEqual(proc.stdout, "REAL --helper-protocol=ntlmssp-client-1 --username u\n")
+        # Another helper protocol goes to the real one even while Kerberus serves.
+        self.serve(lambda client: None)
+        proc = subprocess.run(["ntlm_auth", "--helper-protocol", "squid-2.5-basic"],
+                              env=self.env(path), input="", capture_output=True, text=True, timeout=20)
+        self.assertEqual(proc.stdout, "REAL --helper-protocol squid-2.5-basic\n")
+        # No real one: say so in the protocol.
+        self.server.stop()
+        self.server = None
+        python = Path(self.dir.name) / "python"  # a PATH with python3 but no other ntlm_auth
+        python.mkdir()
+        (python / "python3").symlink_to(sys.executable)
+        proc = subprocess.run([str(self.helper), "--helper-protocol", "ntlmssp-client-1"],
+                              env=self.env(f"{self.helper.parent}:{python}"), input="YR\n", capture_output=True,
+                              text=True, timeout=20)
+        self.assertEqual((proc.returncode, proc.stdout), (1, "BH Kerberus isn't running\n"))
+
+    def test_waits_for_credentials(self):
+        """The TT request holds the connection until credentials come (the sign-in prompt)."""
+        ready = threading.Event()
+
+        def credentials(client):
+            ready.wait(10)
+            return "bob", "CORP", "pw"
+        self.serve(credentials)
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+            s.connect(str(self.runtime / "kerberus" / "ntlm.sock"))
+            s.sendall(b"YR\n")
+            f = s.makefile("rb")
+            negotiate = base64.b64decode(f.readline()[3:])
+            raw = ntlm_client.make_challenge()
+            s.sendall(b"TT " + base64.b64encode(raw) + b"\n")
+            s.settimeout(0.5)
+            with self.assertRaises(TimeoutError):
+                s.recv(1)
+            s.settimeout(10)
+            ready.set()
+            line = f.readline()
+            self.assertTrue(line.startswith(b"AF "), line)
+            self.assertEqual(ntlm_client.verify(negotiate, raw, base64.b64decode(line[3:]), "pw"), ("bob", "CORP"))
+
+
+class SessionSetupTests(unittest.TestCase):
+    def test_environment_file_names_the_helper(self):
+        with tempfile.TemporaryDirectory() as d:
+            saved = kerberus.ENVIRONMENT_D, kerberus.KCM_KRB5_CONF, kerberus.NTLM_HELPER, kerberus.HELPER_DIR
+            run, which, write_helper = subprocess.run, kerberus.shutil.which, kerberus.write_ntlm_helper
+            try:
+                kerberus.shutil.which = lambda name: f"/usr/bin/{name}"
+                kerberus.HELPER_DIR = Path(d) / "bin"
+                kerberus.NTLM_HELPER = kerberus.HELPER_DIR / "ntlm_auth"
+                kerberus.ENVIRONMENT_D = Path(d) / "environment.d" / "60-kerberus.conf"
+                kerberus.KCM_KRB5_CONF = Path(d) / "krb5.conf"
+                kerberus.write_ntlm_helper = lambda path=None: Path(d, "bin").mkdir(exist_ok=True)
+                commands, session = [], {"PATH": "/usr/local/bin:/usr/bin"}
+
+                def run(argv, **kw):  # the systemd user manager's environment, quoted as systemctl prints it
+                    commands.append(argv)
+                    if argv[:3] == ["systemctl", "--user", "set-environment"]:
+                        session.update(a.partition("=")[::2] for a in argv[3:])
+                    shown = "\n".join(f"{k}={shlex.quote(v)}" for k, v in session.items())
+                    return type("P", (), {"returncode": 0, "stdout": shown})()
+                kerberus.subprocess.run = run
+                kerberus.set_session_kcm(True)
+                text = kerberus.ENVIRONMENT_D.read_text()
+                self.assertIn("KRB5CCNAME=KCM:\n", text)
+                self.assertIn(f"PATH={d}/bin${{PATH:+:$PATH}}\n", text)
+                self.assertTrue(kerberus.session_setup_current())
+                self.assertEqual(session["PATH"], f"{d}/bin:/usr/local/bin:/usr/bin")
+                kerberus.set_session_kcm(True)  # again: the directory isn't added twice
+                self.assertEqual(session["PATH"], f"{d}/bin:/usr/local/bin:/usr/bin")
+                kerberus.set_session_kcm(False)
+                self.assertFalse(kerberus.ENVIRONMENT_D.exists())
+                self.assertFalse(kerberus.session_setup_current())
+                self.assertEqual(session["PATH"], "/usr/local/bin:/usr/bin")
+                self.assertIn(["systemctl", "--user", "unset-environment", "KRB5CCNAME", "KRB5_CONFIG"], commands)
+                done = len(commands)
+                kerberus.set_session_kcm(False)  # nothing of ours left in PATH: leave it alone
+                self.assertFalse(any("PATH=" in a for c in commands[done:] for a in c), commands[done:])
+            finally:
+                kerberus.subprocess.run, kerberus.shutil.which, kerberus.write_ntlm_helper = run, which, write_helper
+                kerberus.ENVIRONMENT_D, kerberus.KCM_KRB5_CONF, kerberus.NTLM_HELPER, kerberus.HELPER_DIR = saved
 
 
 if __name__ == "__main__":
