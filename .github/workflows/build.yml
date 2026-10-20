@@ -39,7 +39,12 @@ jobs:
         run: /usr/bin/python3 -m unittest discover -s tests -v
 
       - name: Integration tests (from source)
-        run: tests/integration.sh /usr/bin/python3 kerberus.py
+        run: |
+          tests/integration.sh /usr/bin/python3 kerberus.py
+          KERBERUS_KCM=1 tests/integration.sh /usr/bin/python3 kerberus.py
+
+      - name: Sign-in prompt and tray icon (from source)
+        run: PYTHON=/usr/bin/python3 tests/prompt_e2e.sh /usr/bin/python3 kerberus.py
 
       - name: Build the AppImage
         run: packaging/appimage/build.sh "${{ steps.version.outputs.version }}"
@@ -52,6 +57,12 @@ jobs:
 
       - name: Integration tests (AppImage, bundled Kerberos tools)
         run: KERBERUS_TOOLS=bundled tests/integration.sh dist/Kerberus-*.AppImage --appimage-extract-and-run
+
+      - name: Integration tests (AppImage as the credential cache)
+        run: KERBERUS_KCM=1 tests/integration.sh dist/Kerberus-*.AppImage --appimage-extract-and-run
+
+      - name: Sign-in prompt and tray icon (AppImage)
+        run: PYTHON=/usr/bin/python3 tests/prompt_e2e.sh dist/Kerberus-*.AppImage --appimage-extract-and-run
 
       - uses: actions/upload-artifact@v4
         with:

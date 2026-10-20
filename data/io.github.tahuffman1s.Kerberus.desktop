@@ -7,5 +7,5 @@ Exec=kerberus
 Icon=io.github.tahuffman1s.Kerberus
 Terminal=false
 Categories=System;Security;
-Keywords=kerberos;krb5;kinit;klist;ticket;tgt;realm;sso;
+Keywords=kerberos;krb5;kinit;klist;ticket;tgt;realm;sso;negotiate;sign in;active directory;
 StartupNotify=true

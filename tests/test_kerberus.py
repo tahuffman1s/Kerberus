@@ -3,8 +3,12 @@ renewal decisions and message cleanup. tests/integration.sh covers the rest."""
 
 import datetime as dt
 import importlib.util
+import socket
+import struct
 import subprocess
 import sys
+import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -179,6 +183,11 @@ class TextTests(unittest.TestCase):
         self.assertEqual(kerberus.desktop_quote("/opt/Kerberus.AppImage"), "/opt/Kerberus.AppImage")
         self.assertEqual(kerberus.desktop_quote("/home/a b/K$.AppImage"), '"/home/a b/K\\$.AppImage"')
 
+    def test_program_names(self):
+        self.assertEqual(kerberus.program_name("/usr/bin/kdestroy.mit"), "kdestroy")
+        self.assertEqual(kerberus.program_name("/nix/store/x-firefox/bin/.firefox-wrapped"), "firefox")
+        self.assertEqual(kerberus.program_name("/opt/google/chrome/chrome"), "chrome")
+
     def test_full_principal(self):
         original = kerberus.default_realm
         kerberus.default_realm = lambda: "EXAMPLE.TEST"
@@ -187,6 +196,130 @@ class TextTests(unittest.TestCase):
             self.assertEqual(kerberus.full_principal("bob@OTHER"), "bob@OTHER")
         finally:
             kerberus.default_realm = original
+
+
+def counted(data):
+    return struct.pack(">I", len(data)) + data
+
+
+def principal(name):
+    """A principal in the v4 ccache layout."""
+    parts, _, realm = name.rpartition("@")
+    comps = parts.split("/")
+    return struct.pack(">II", 1, len(comps)) + counted(realm.encode()) + b"".join(counted(c.encode()) for c in comps)
+
+
+def cred(client, server, end, ticket=b"ticket"):
+    now = int(time.time())
+    return (principal(client) + principal(server) + struct.pack(">H", 18) + counted(b"k" * 32)
+            + struct.pack(">IIII", now, now, end, end + 3600) + b"\0" + struct.pack(">III", 0, 0, 0)
+            + counted(ticket) + counted(b""))
+
+
+def request(*parts):
+    return kerberus.KcmReader(b"".join(p if isinstance(p, bytes) else p.encode() + b"\0" for p in parts))
+
+
+class KcmStoreTests(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.store = kerberus.KcmStore(Path(self.dir.name) / "caches.json", uid=1000)
+        self.later = int(time.time()) + 3600
+
+    def tearDown(self):
+        self.dir.cleanup()
+
+    def call(self, op, *parts):
+        return self.store.handle(op, request(*parts))
+
+    def sign_in(self, name="1000", who="alice@R", end=None):
+        self.assertEqual(self.call(kerberus.KCM_OP_INITIALIZE, name, principal(who))[0], 0)
+        self.assertEqual(self.call(kerberus.KCM_OP_STORE, name, cred(who, "krbtgt/R@R", end or self.later))[0], 0)
+
+    def test_empty(self):
+        self.assertEqual(self.call(kerberus.KCM_OP_GET_DEFAULT_CACHE), (0, b"1000\0"))
+        self.assertEqual(self.call(kerberus.KCM_OP_GET_PRINCIPAL, "1000")[0], kerberus.KRB5_FCC_NOFILE)
+        self.assertEqual(self.call(kerberus.KCM_OP_GET_CACHE_UUID_LIST)[0], kerberus.KRB5_FCC_NOFILE)
+        self.assertTrue(self.store.needs_sign_in())
+        self.assertTrue(self.store.needs_sign_in("1000"))
+
+    def test_sign_in_and_list(self):
+        self.sign_in()
+        self.assertEqual(self.call(kerberus.KCM_OP_GET_PRINCIPAL, "1000"), (0, principal("alice@R")))
+        self.assertFalse(self.store.needs_sign_in("1000"))
+        self.assertFalse(self.store.needs_sign_in())
+        self.call(kerberus.KCM_OP_STORE, "1000", cred("alice@R", "HTTP/web@R", self.later))
+        status, reply = self.call(kerberus.KCM_OP_GET_CRED_LIST, "1000")
+        r = kerberus.KcmReader(reply)
+        creds = [kerberus.KcmCred.parse(r.counted()) for _ in range(r.u32())]
+        self.assertEqual([c.server for c in creds], ["krbtgt/R@R", "HTTP/web@R"])
+        uuids = self.call(kerberus.KCM_OP_GET_CRED_UUID_LIST, "1000")[1]
+        self.assertEqual(len(uuids), 32)
+        self.assertEqual(self.call(kerberus.KCM_OP_GET_CRED_BY_UUID, "1000", uuids[16:])[1], creds[1].raw)
+
+    def test_newer_ticket_replaces_older(self):
+        self.sign_in()
+        self.call(kerberus.KCM_OP_STORE, "1000", cred("alice@R", "HTTP/web@R", self.later, b"old"))
+        self.call(kerberus.KCM_OP_STORE, "1000", cred("alice@R", "HTTP/web@R", self.later + 60, b"new"))
+        cache = self.store.caches["1000"]
+        self.assertEqual(len(cache.creds), 2)
+        self.assertEqual(cache.creds[-1].endtime, self.later + 60)
+
+    def test_expired_tgt_needs_sign_in(self):
+        self.sign_in(end=int(time.time()) - 10)
+        self.assertTrue(self.store.needs_sign_in("1000"))
+        self.assertEqual(self.store.describe(None), ("alice@R", "1000"))
+
+    def test_collection(self):
+        self.sign_in()
+        name = self.call(kerberus.KCM_OP_GEN_NEW)[1].rstrip(b"\0").decode()
+        self.assertTrue(name.startswith("1000:"))
+        self.sign_in(name, "bob@R")
+        self.call(kerberus.KCM_OP_SET_DEFAULT_CACHE, name)
+        self.assertEqual(self.call(kerberus.KCM_OP_GET_DEFAULT_CACHE)[1], name.encode() + b"\0")
+        uuids = self.call(kerberus.KCM_OP_GET_CACHE_UUID_LIST)[1]
+        names = {self.call(kerberus.KCM_OP_GET_CACHE_BY_UUID, uuids[i:i + 16])[1] for i in (0, 16)}
+        self.assertEqual(names, {b"1000\0", name.encode() + b"\0"})
+        self.assertEqual(self.call(kerberus.KCM_OP_DESTROY, name)[0], 0)
+        self.assertEqual(self.call(kerberus.KCM_OP_GET_PRINCIPAL, name)[0], kerberus.KRB5_FCC_NOFILE)
+
+    def test_replace(self):
+        creds = [cred("bob@R", "krbtgt/R@R", self.later), cred("bob@R", "HTTP/x@R", self.later)]
+        r = request("1000", struct.pack(">i", 5), principal("bob@R"), struct.pack(">I", 2),
+                    *[counted(c) for c in creds])
+        self.assertEqual(self.store.handle(kerberus.KCM_OP_REPLACE, r)[0], 0)
+        cache = self.store.caches["1000"]
+        self.assertEqual((cache.principal_name, cache.kdc_offset, len(cache.creds)), ("bob@R", 5, 2))
+
+    def test_saved_and_loaded(self):
+        self.sign_in()
+        again = kerberus.KcmStore(self.store.path, uid=1000)
+        self.assertEqual(again.caches["1000"].principal_name, "alice@R")
+        self.assertFalse(again.needs_sign_in("1000"))
+        self.assertEqual(self.store.path.stat().st_mode & 0o777, 0o600)
+
+    def test_unsupported_and_malformed(self):
+        self.sign_in()
+        self.assertEqual(self.call(7, "1000")[0], kerberus.KRB5_CC_NOSUPP)  # RETRIEVE: the client iterates
+        with self.assertRaises(ValueError):
+            self.call(kerberus.KCM_OP_STORE, "1000", b"\0\0\0")
+
+    def test_over_a_socket(self):
+        path = Path(self.dir.name) / "kcm.sock"
+        server = kerberus.KcmServer(self.store, path, log=lambda m: None)
+        server.start()
+        try:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+                s.connect(str(path))
+                body = struct.pack(">BBH", 2, 0, kerberus.KCM_OP_GET_DEFAULT_CACHE)
+                s.sendall(struct.pack(">I", len(body)) + body)
+                length, transport, status = struct.unpack(">IIi", s.recv(12))
+                self.assertEqual((transport, status), (0, 0))
+                self.assertEqual(s.recv(length - 4), b"1000\0")
+            with self.assertRaises(RuntimeError):  # a second server on the same socket
+                kerberus.KcmServer(self.store, path).start()
+        finally:
+            server.stop()
 
 
 if __name__ == "__main__":

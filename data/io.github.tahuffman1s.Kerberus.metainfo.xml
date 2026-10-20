@@ -12,6 +12,8 @@
       tickets it gets are the ones kinit and klist see.
     </p>
     <ul>
+      <li>When an app needs to sign in with Kerberos and you have no ticket, ask which identity to use, and let the app carry on once you have</li>
+      <li>Stay in the tray, showing whether you're signed in</li>
       <li>See every principal in the cache collection, when its tickets expire and how long they can be renewed</li>
       <li>Sign in, renew, switch the default principal and destroy tickets</li>
       <li>Renew tickets automatically before they expire, in the background if you like</li>

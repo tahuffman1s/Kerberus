@@ -11,20 +11,30 @@ GUI by default (GTK 4 and libadwaita). Subcommands for the terminal:
     kerberus switch PRINCIPAL             make a principal's cache the default
     kerberus passwd [PRINCIPAL]           change a Kerberos password
     kerberus forget PRINCIPAL             remove a saved password from the keyring
-    kerberus watch [--once]               renew in the terminal, without a window
+    kerberus watch [--once] [--kcm]       renew in the terminal, without a window
 
 It drives the MIT Kerberos tools (kinit, klist, kdestroy, kswitch, kpasswd), so it
 uses the machine's krb5.conf and credential caches. The AppImage carries its own
 copies of the tools for machines that don't have them installed.
+
+With sign-in prompts turned on (Preferences), Kerberus is also the session's
+credential cache: it serves the KCM protocol on a socket that every Kerberos
+app is pointed at, so when an app (a browser doing Negotiate, smbclient, ssh)
+needs a ticket and there isn't a valid one, Kerberus asks who to sign in as and
+the app carries on once you have.
 """
 
 import argparse
+import base64
 import datetime as dt
 import getpass
 import json
 import os
 import re
+import secrets
 import shutil
+import socket
+import struct
 import subprocess
 import sys
 import threading
@@ -46,7 +56,12 @@ DEFAULT_SETTINGS = {
     "reacquire": True,        # sign in again with a saved password when renewing isn't possible
     "notify": True,           # warn before a ticket expires
     "notify_before": 15,      # minutes
-    "background": False,      # keep running (and renewing) after the window is closed
+    "background": True,       # keep running (and renewing) in the tray after the window is closed
+    "kcm": False,             # be the session's credential cache and prompt when apps need a ticket
+    "prompt_timeout": 120,    # seconds an app waits for you to sign in
+    "ignored_apps": [],       # apps that never get a sign-in prompt
+    "identities": [],         # principals signed in with before, most recent first
+    "kcm_offer_dismissed": False,
     "last_principal": "",
     "lifetime": "",           # kinit -l; "" is the realm's default
     "renewable": "",          # kinit -r
@@ -133,7 +148,8 @@ def set_autostart(enabled):
 
 def host_env():
     """The environment for the Kerberos tools: the host's, with dates and
-    messages in the C locale so klist's output can be parsed."""
+    messages in the C locale so klist's output can be parsed, pointed at
+    Kerberus's credential cache when that's turned on."""
     env = dict(os.environ)
     if env.pop("KERBERUS_APPDIR", None):
         for name in APPIMAGE_VARS:
@@ -141,8 +157,12 @@ def host_env():
             saved = env.pop(f"KERBERUS_HOST_{name}", None)
             if saved is not None:
                 env[name] = saved
+    env.update(TOOLS_ENV)
     env["LC_ALL"] = "C"
     return env
+
+
+TOOLS_ENV = {}  # set by use_kcm()
 
 
 def find_tools():
@@ -581,6 +601,479 @@ def maintain(caches, settings, keyring=None, now=None, log=print, failed=None):
 
 
 # ---------------------------------------------------------------------------
+# Kerberus as the credential cache (KCM)
+#
+# MIT Kerberos's KCM: cache type keeps credentials in a daemon reached over a
+# Unix socket. Pointing the session's apps at Kerberus's socket (KRB5CCNAME=KCM:
+# plus a krb5.conf naming the socket, set through environment.d) means every
+# app that needs a ticket asks Kerberus first, which is how it knows to ask you
+# to sign in. The protocol is the subset MIT's client speaks (src/include/kcm.h
+# and src/lib/krb5/ccache/cc_kcm.c in krb5): requests are a 4-byte length, the
+# version (2, 0), a 16-bit opcode and parameters; replies are a length, a
+# transport code and the payload, which starts with a krb5 error code.
+# Principals and credentials use the v4 FILE ccache layout and are kept as the
+# client sent them.
+
+RUNTIME_DIR = Path(os.environ.get("XDG_RUNTIME_DIR") or f"/tmp/kerberus-{os.getuid()}") / "kerberus"
+KCM_SOCKET = RUNTIME_DIR / "kcm.sock"
+KCM_STATE = RUNTIME_DIR / "caches.json"  # tmpfs like /tmp/krb5cc_*; survives a restart, not a logout
+KCM_KRB5_CONF = CONFIG_HOME / "kerberus" / "krb5.conf"
+ENVIRONMENT_D = CONFIG_HOME / "environment.d" / "60-kerberus.conf"
+
+(KCM_OP_NOOP, KCM_OP_GEN_NEW, KCM_OP_INITIALIZE, KCM_OP_DESTROY, KCM_OP_STORE, KCM_OP_GET_PRINCIPAL,
+ KCM_OP_GET_CRED_UUID_LIST, KCM_OP_GET_CRED_BY_UUID, KCM_OP_GET_CACHE_UUID_LIST, KCM_OP_GET_CACHE_BY_UUID,
+ KCM_OP_GET_DEFAULT_CACHE, KCM_OP_SET_DEFAULT_CACHE, KCM_OP_GET_KDC_OFFSET, KCM_OP_SET_KDC_OFFSET,
+ KCM_OP_GET_CRED_LIST, KCM_OP_REPLACE) = (0, 3, 4, 5, 6, 8, 9, 10, 18, 19, 20, 21, 22, 23, 13001, 13002)
+# What an app asks just before it needs a ticket; the moment to prompt.
+KCM_TICKET_OPS = {KCM_OP_GET_PRINCIPAL, KCM_OP_GET_CRED_LIST, KCM_OP_GET_CRED_UUID_LIST, KCM_OP_GET_CACHE_UUID_LIST}
+KRB5_CC_END = -1765328242
+KRB5_CC_IO = -1765328191
+KRB5_FCC_NOFILE = -1765328189
+KRB5_CC_FORMAT = -1765328185
+KRB5_CC_NOSUPP = -1765328137  # the client falls back (RETRIEVE) or reports it (REMOVE_CRED, only kdeltkt)
+# Programs that look at caches without needing a ticket from you: the Kerberos
+# tools themselves and desktop services that watch the collection.
+DEBUG = bool(os.environ.get("KERBERUS_DEBUG"))  # log each KCM request
+QUIET_PROGRAMS = {"klist", "kinit", "kdestroy", "kswitch", "kpasswd", "ktutil", "kadmin", "kerberus",
+                  "goa-identity-service", "goa-daemon", "realmd", "sssd", "gssproxy"}
+
+
+class KcmReader:
+    def __init__(self, data):
+        self.data, self.pos = data, 0
+
+    def take(self, n):
+        if n < 0 or self.pos + n > len(self.data):
+            raise ValueError("truncated request")
+        chunk = self.data[self.pos:self.pos + n]
+        self.pos += n
+        return chunk
+
+    def u16(self):
+        return struct.unpack(">H", self.take(2))[0]
+
+    def u32(self):
+        return struct.unpack(">I", self.take(4))[0]
+
+    def i32(self):
+        return struct.unpack(">i", self.take(4))[0]
+
+    def counted(self):
+        return self.take(self.u32())
+
+    def name(self):
+        end = self.data.find(b"\0", self.pos)
+        if end < 0:
+            raise ValueError("unterminated name")
+        return self.take(end - self.pos + 1)[:-1].decode("utf-8", "replace")
+
+    def principal(self):
+        """(raw bytes, "a/b@REALM")"""
+        start = self.pos
+        self.u32()  # name type
+        count = self.u32()
+        realm = self.counted().decode("utf-8", "replace")
+        parts = [self.counted().decode("utf-8", "replace") for _ in range(count)]
+        return self.data[start:self.pos], "/".join(parts) + "@" + realm
+
+    def rest(self):
+        return self.take(len(self.data) - self.pos)
+
+
+@dataclass
+class KcmCred:
+    raw: bytes
+    uuid: bytes
+    client: str
+    server: str
+    starttime: int
+    endtime: int
+    renew_till: int
+
+    @classmethod
+    def parse(cls, raw, uuid=None):
+        r = KcmReader(raw)
+        _, client = r.principal()
+        _, server = r.principal()
+        r.u16()  # session key type
+        r.counted()
+        authtime, starttime, endtime, renew_till = r.u32(), r.u32(), r.u32(), r.u32()
+        r.take(1)  # is_skey
+        r.u32()  # ticket flags
+        for _ in range(r.u32()):  # addresses
+            r.u16()
+            r.counted()
+        for _ in range(r.u32()):  # authorization data
+            r.u16()
+            r.counted()
+        r.counted()  # ticket
+        r.counted()  # second ticket
+        if r.pos != len(raw):
+            raise ValueError("trailing bytes after a credential")
+        return cls(raw, uuid or secrets.token_bytes(16), client, server, starttime or authtime, endtime, renew_till)
+
+
+@dataclass
+class KcmCache:
+    name: str
+    uuid: bytes = field(default_factory=lambda: secrets.token_bytes(16))
+    principal: bytes | None = None
+    principal_name: str = ""
+    creds: list = field(default_factory=list)
+    kdc_offset: int = 0
+
+    def tgt_end(self):
+        """When the TGT for the principal's realm expires (0 if there isn't one)."""
+        realm = self.principal_name.rpartition("@")[2]
+        own = f"krbtgt/{realm}@{realm}"
+        return max((c.endtime for c in self.creds if c.server == own), default=0)
+
+    def valid(self, now=None):
+        return self.tgt_end() > (now or time.time()) + 30
+
+
+class KcmStore:
+    """The credential caches Kerberus serves, saved to the runtime directory."""
+
+    def __init__(self, path=None, uid=None):
+        self.lock = threading.RLock()
+        self.path = path
+        self.primary = str(os.getuid() if uid is None else uid)
+        self.caches = {}
+        self.default = self.primary
+        self.changed = None  # called (outside the lock) after any change
+        if path:
+            self.load()
+
+    def load(self):
+        try:
+            data = json.loads(self.path.read_text())
+            for c in data["caches"]:
+                cache = KcmCache(c["name"], bytes.fromhex(c["uuid"]), kdc_offset=c.get("kdc_offset", 0))
+                if c.get("principal"):
+                    cache.principal = base64.b64decode(c["principal"])
+                    cache.principal_name = KcmReader(cache.principal).principal()[1]
+                cache.creds = [KcmCred.parse(base64.b64decode(raw)) for raw in c["creds"]]
+                self.caches[cache.name] = cache
+            self.default = data.get("default") or self.primary
+        except (OSError, ValueError, KeyError, TypeError):
+            pass
+
+    def save(self):
+        if not self.path:
+            return
+        data = {"default": self.default, "caches": [
+            {"name": c.name, "uuid": c.uuid.hex(), "kdc_offset": c.kdc_offset,
+             "principal": base64.b64encode(c.principal).decode() if c.principal else None,
+             "creds": [base64.b64encode(cred.raw).decode() for cred in c.creds]}
+            for c in self.caches.values()]}
+        self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        tmp = self.path.with_suffix(".tmp")
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as f:
+            json.dump(data, f)
+        os.replace(tmp, self.path)
+
+    def needs_sign_in(self, name=None):
+        """True if the named cache (or, with no name, the whole collection) has no valid TGT."""
+        with self.lock:
+            if name is None:
+                return not any(c.valid() for c in self.caches.values())
+            cache = self.caches.get(name)
+            return cache is None or not cache.valid()
+
+    def describe(self, name):
+        """(principal, default cache name) for prompting about a cache."""
+        with self.lock:
+            name = name or self.default
+            cache = self.caches.get(name)
+            return (cache.principal_name if cache else ""), name
+
+    def handle(self, opcode, r):
+        """Run one request; returns (krb5 error code, reply bytes)."""
+        with self.lock:
+            status, reply, changed = self._handle(opcode, r)
+            if changed:
+                self.save()
+        if changed and self.changed:
+            self.changed()
+        return status, reply
+
+    def _cache(self, r):
+        name = r.name()
+        return name, self.caches.get(name)
+
+    def _handle(self, op, r):
+        if op == KCM_OP_NOOP:
+            return 0, b"", False
+        if op == KCM_OP_GET_DEFAULT_CACHE:
+            return 0, self.default.encode() + b"\0", False
+        if op == KCM_OP_SET_DEFAULT_CACHE:
+            self.default = r.name()
+            return 0, b"", True
+        if op == KCM_OP_GEN_NEW:
+            name = f"{self.primary}:{secrets.token_hex(4)}"
+            self.caches[name] = KcmCache(name)
+            return 0, name.encode() + b"\0", True
+        if op == KCM_OP_GET_CACHE_UUID_LIST:
+            uuids = [c.uuid for c in self.caches.values() if c.principal]
+            return (0, b"".join(uuids), False) if uuids else (KRB5_FCC_NOFILE, b"", False)
+        if op == KCM_OP_GET_CACHE_BY_UUID:
+            uuid = r.take(16)
+            cache = next((c for c in self.caches.values() if c.uuid == uuid), None)
+            return (0, cache.name.encode() + b"\0", False) if cache else (KRB5_CC_END, b"", False)
+        if op in (KCM_OP_INITIALIZE, KCM_OP_REPLACE):
+            name, cache = self._cache(r)
+            cache = cache or KcmCache(name)
+            offset = r.i32() if op == KCM_OP_REPLACE else cache.kdc_offset
+            principal, principal_name = r.principal()
+            creds = [KcmCred.parse(r.counted()) for _ in range(r.u32())] if op == KCM_OP_REPLACE else []
+            cache.principal, cache.principal_name, cache.creds, cache.kdc_offset = (
+                principal, principal_name, creds, offset)
+            self.caches[name] = cache
+            return 0, b"", True
+
+        name, cache = self._cache(r)
+        if cache is None:
+            return KRB5_FCC_NOFILE, b"", False
+        if op == KCM_OP_DESTROY:
+            del self.caches[name]
+            return 0, b"", True
+        if op == KCM_OP_GET_PRINCIPAL:
+            return (0, cache.principal, False) if cache.principal else (KRB5_FCC_NOFILE, b"", False)
+        if op == KCM_OP_STORE:
+            cred = KcmCred.parse(r.rest())
+            # A newer ticket for the same service replaces the old one.
+            cache.creds = [c for c in cache.creds if (c.client, c.server) != (cred.client, cred.server)]
+            cache.creds.append(cred)
+            return 0, b"", True
+        if op == KCM_OP_GET_CRED_LIST:
+            body = b"".join(struct.pack(">I", len(c.raw)) + c.raw for c in cache.creds)
+            return 0, struct.pack(">I", len(cache.creds)) + body, False
+        if op == KCM_OP_GET_CRED_UUID_LIST:
+            return 0, b"".join(c.uuid for c in cache.creds), False
+        if op == KCM_OP_GET_CRED_BY_UUID:
+            uuid = r.take(16)
+            cred = next((c for c in cache.creds if c.uuid == uuid), None)
+            return (0, cred.raw, False) if cred else (KRB5_CC_END, b"", False)
+        if op == KCM_OP_GET_KDC_OFFSET:
+            return 0, struct.pack(">i", cache.kdc_offset), False
+        if op == KCM_OP_SET_KDC_OFFSET:
+            cache.kdc_offset = r.i32()
+            return 0, b"", True
+        return KRB5_CC_NOSUPP, b"", False
+
+
+@dataclass
+class KcmClient:
+    """The process on the other end of a KCM connection."""
+    pid: int
+    program: str = ""
+    quiet: bool = True
+
+    @classmethod
+    def from_pid(cls, pid):
+        try:
+            exe = os.readlink(f"/proc/{pid}/exe")
+        except OSError:
+            exe = ""
+        program = program_name(exe) or "unknown"
+        return cls(pid, program, program in QUIET_PROGRAMS or descends_from(pid, os.getpid()))
+
+
+def program_name(path):
+    """What to call an executable: NixOS wraps programs as .name-wrapped, and
+    Debian installs the Kerberos tools as klist.mit behind alternatives."""
+    return re.sub(r"^\.|-wrapped$|-bin$|\.(mit|heimdal)$", "", os.path.basename(path))
+
+
+def descends_from(pid, ancestor):
+    for _ in range(64):
+        if pid == ancestor:
+            return True
+        if pid <= 1:
+            return False
+        try:
+            with open(f"/proc/{pid}/stat") as f:
+                pid = int(f.read().rpartition(")")[2].split()[1])
+        except (OSError, ValueError, IndexError):
+            return False
+    return False
+
+
+class KcmServer:
+    """Serves a KcmStore on a Unix socket, one thread per connection.
+
+    need_ticket(client, cache_name) is called, on that connection's thread,
+    when an app asks for a cache without a valid TGT; the request waits until it
+    returns, so a ticket you sign in for answers the request that asked."""
+
+    def __init__(self, store, path=KCM_SOCKET, need_ticket=None, log=print):
+        self.store, self.path, self.need_ticket, self.log = store, Path(path), need_ticket, log
+        self.sock = None
+
+    def start(self):
+        self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        # Apps trust whatever answers on this socket with their tickets, so the
+        # directories above it must be ours (the /tmp fallback could be someone else's).
+        for directory in (self.path.parent, self.path.parent.parent):
+            if directory.stat().st_uid != os.getuid():
+                raise RuntimeError(f"{directory} belongs to another user")
+        os.chmod(self.path.parent, 0o700)
+        if self.path.exists():
+            probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            try:
+                probe.connect(str(self.path))
+                raise RuntimeError(f"another Kerberus is already serving {self.path}")
+            except (ConnectionRefusedError, FileNotFoundError):
+                self.path.unlink(missing_ok=True)
+            finally:
+                probe.close()
+        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.sock.bind(str(self.path))
+        os.chmod(self.path, 0o600)
+        self.sock.listen(32)
+        threading.Thread(target=self.accept_loop, daemon=True, name="kcm-accept").start()
+
+    def stop(self):
+        if self.sock:
+            self.sock.close()
+            self.sock = None
+            self.path.unlink(missing_ok=True)
+
+    def accept_loop(self):
+        while self.sock:
+            try:
+                conn, _ = self.sock.accept()
+            except OSError:
+                return
+            threading.Thread(target=self.serve, args=(conn,), daemon=True, name="kcm-client").start()
+
+    @staticmethod
+    def recv_exact(conn, n):
+        data = b""
+        while len(data) < n:
+            chunk = conn.recv(n - len(data))
+            if not chunk:
+                raise EOFError
+            data += chunk
+        return data
+
+    def serve(self, conn):
+        with conn:
+            pid, uid, _ = struct.unpack("3i", conn.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED,
+                                                              struct.calcsize("3i")))
+            if uid != os.getuid():
+                return
+            client = None
+            try:
+                while True:
+                    length = struct.unpack(">I", self.recv_exact(conn, 4))[0]
+                    if length < 4 or length > 10 * 1024 * 1024:
+                        return
+                    request = self.recv_exact(conn, length)
+                    opcode = struct.unpack(">H", request[2:4])[0]
+                    if DEBUG:
+                        client = client or KcmClient.from_pid(pid)
+                        self.log(f"kcm: {client.program}[{pid}] op {opcode} {request[4:60]!r}")
+                    if self.need_ticket and opcode in KCM_TICKET_OPS:
+                        name = None
+                        if opcode != KCM_OP_GET_CACHE_UUID_LIST:
+                            end = request.find(b"\0", 4)
+                            name = request[4:end].decode("utf-8", "replace") if end > 0 else None
+                        if self.store.needs_sign_in(name):
+                            client = client or KcmClient.from_pid(pid)
+                            if not client.quiet:
+                                self.need_ticket(client, name)
+                    try:
+                        status, reply = self.store.handle(opcode, KcmReader(request[4:]))
+                    except (ValueError, struct.error) as e:
+                        self.log(f"Bad KCM request (opcode {opcode}) from pid {pid}: {e}")
+                        status, reply = KRB5_CC_FORMAT, b""
+                    payload = struct.pack(">i", status) + reply
+                    conn.sendall(struct.pack(">II", len(payload), 0) + payload)
+            except (EOFError, ConnectionError, OSError):
+                return
+
+
+def recover_quietly(principal, cache, settings, keyring=None, failed=None):
+    """Give a KCM cache a valid ticket for its principal without asking: renew
+    it, or sign in again with the saved password. True if that worked. A saved
+    password the KDC rejects goes into `failed` and isn't tried again."""
+    ccname = f"KCM:{cache}"
+    if settings["auto_renew"] and result_of(run_tool("kinit", "-R", "-c", ccname)).ok:
+        return True
+    if keyring is None or not settings["reacquire"] or principal in (failed or ()):
+        return False
+    password = keyring.lookup(principal)
+    if password is None:
+        return False
+    if get_ticket(principal, password, cache=ccname, **ticket_options(settings)).ok:
+        return True
+    if failed is not None:
+        failed.add(principal)
+    return False
+
+
+def base_krb5_config():
+    """The krb5.conf files apps would read without Kerberus."""
+    ours = str(KCM_KRB5_CONF)
+    paths = [p for p in os.environ.get("KRB5_CONFIG", "/etc/krb5.conf").split(":") if p and p != ours]
+    return ":".join(paths) or "/etc/krb5.conf"
+
+
+def kcm_env():
+    return {"KRB5CCNAME": "KCM:", "KRB5_CONFIG": f"{KCM_KRB5_CONF}:{base_krb5_config()}"}
+
+
+def use_kcm(enabled):
+    """Point the Kerberos tools Kerberus runs at its own cache (or not)."""
+    TOOLS_ENV.clear()
+    if enabled:
+        write_kcm_config()
+        TOOLS_ENV.update(kcm_env())
+
+
+def write_kcm_config():
+    """The krb5.conf apps read first: it only names Kerberus's socket, and the
+    files after it in KRB5_CONFIG supply the realms."""
+    KCM_KRB5_CONF.parent.mkdir(parents=True, exist_ok=True)
+    KCM_KRB5_CONF.write_text(
+        "# Written by Kerberus. Apps read this before the system's krb5.conf (see KRB5_CONFIG)\n"
+        "# so that their tickets live in Kerberus, which asks you to sign in when they need one.\n"
+        "[libdefaults]\n"
+        "    default_ccache_name = KCM:\n"
+        f"    kcm_socket = {KCM_SOCKET}\n"
+    )
+
+
+def session_kcm_enabled():
+    return ENVIRONMENT_D.exists()
+
+
+def set_session_kcm(enabled):
+    """Make the session's apps use Kerberus's cache from the next login (environment.d),
+    and tell the running systemd user manager and D-Bus activation environment now."""
+    if enabled:
+        write_kcm_config()
+        env = kcm_env()
+        ENVIRONMENT_D.parent.mkdir(parents=True, exist_ok=True)
+        ENVIRONMENT_D.write_text(
+            "# Written by Kerberus (Preferences → Sign-In Prompts): Kerberos apps keep their\n"
+            "# tickets in Kerberus, which asks you to sign in when one needs a ticket.\n"
+            + "".join(f"{k}={v}\n" for k, v in env.items()))
+        assignments = [f"{k}={v}" for k, v in env.items()]
+        commands = [["systemctl", "--user", "set-environment", *assignments],
+                    ["dbus-update-activation-environment", *assignments]]
+    else:
+        ENVIRONMENT_D.unlink(missing_ok=True)
+        commands = [["systemctl", "--user", "unset-environment", "KRB5CCNAME", "KRB5_CONFIG"]]
+    for argv in commands:
+        if shutil.which(argv[0]):
+            subprocess.run(argv, env=host_env(), capture_output=True, check=False)
+
+
+# ---------------------------------------------------------------------------
 # CLI
 
 
@@ -626,6 +1119,8 @@ def cli(args):
     if not TOOL_PATHS["klist"]:
         print(MISSING_TOOLS, file=sys.stderr)
         return 1
+    serve = args.command == "watch" and args.kcm
+    use_kcm(load_settings()["kcm"] or serve)
     now = dt.datetime.now()
 
     if args.command == "list":
@@ -672,6 +1167,23 @@ def cli(args):
     if args.command == "watch":
         settings = load_settings()
         failed, told = set(), set()
+        if serve:
+            store, lock = KcmStore(KCM_STATE), threading.Lock()
+
+            def need_ticket(client, name):
+                principal, cache = store.describe(name)
+                with lock:
+                    if principal and store.needs_sign_in(name):
+                        ok = recover_quietly(principal, cache, settings, keyring, failed)
+                        print(f"{client.program} needs a ticket for {principal}: "
+                              + ("got one" if ok else "sign in with the window or kerberus get"), flush=True)
+            server = KcmServer(store, need_ticket=need_ticket, log=lambda m: print(m, flush=True))
+            try:
+                server.start()
+            except (RuntimeError, OSError) as e:
+                print(f"Can't serve the credential cache: {e}", file=sys.stderr)
+                return 1
+            print(f"Serving the KCM credential cache on {KCM_SOCKET}.", flush=True)
         print(f"Watching tickets every {args.interval} s (renew {settings['renew_before']} min ahead).", flush=True)
         while True:
             notices = maintain(list_caches(), settings, keyring, log=lambda m: print(m, flush=True), failed=failed)
@@ -703,6 +1215,18 @@ def cli(args):
 
 # ---------------------------------------------------------------------------
 # GUI
+
+
+def icon_dir():
+    """The icon theme directory with the app and tray icons: data/icons in a
+    checkout, usr/share/icons in the AppImage."""
+    here = Path(__file__).resolve().parent
+    for candidate in (here / "data" / "icons", here.parent / "icons"):
+        if (candidate / "hicolor" / "scalable" / "apps" / f"{APP_ID}.svg").exists():
+            return candidate
+    return None
+
+
 
 
 def gui(background=False, smoke_test=False):
@@ -739,6 +1263,22 @@ def gui(background=False, smoke_test=False):
     def esc(text):
         return GLib.markup_escape_text(text)
 
+    @dataclass
+    class PromptRequest:
+        """An app waiting (on a KCM connection thread) for you to sign in."""
+        client: KcmClient
+        principal: str
+        cache: str
+        done: threading.Event = field(default_factory=threading.Event)
+
+    def app_info_for(program):
+        """The installed app (desktop file) whose executable is `program`."""
+        for info in Gio.AppInfo.get_all():
+            exe = info.get_executable() or ""
+            if exe and program_name(exe) == program:
+                return info
+        return None
+
     class App(Adw.Application):
         def __init__(self):
             flags = getattr(Gio.ApplicationFlags, "DEFAULT_FLAGS", Gio.ApplicationFlags.FLAGS_NONE)
@@ -752,19 +1292,31 @@ def gui(background=False, smoke_test=False):
             self.start_hidden = background
             self.held = False
             self.refreshing = False
+            self.refresh_again = False
+            self.refresh_queued = False
             self.maintaining = False
             self.failed = set()       # principals whose saved password was rejected
             self.told = set()         # notifications already sent
+            self.store = None         # the KCM caches, when Kerberus is the credential cache
+            self.server = None
+            self.kcm_error = None
+            self.prompt = None        # the PromptRequest being answered
+            self.prompt_lock = threading.Lock()
+            self.recover_lock = threading.Lock()
+            self.snoozed = {}         # program -> time until which it isn't prompted for
+            self.picker = None
+            self.tray = None
 
         def do_startup(self):
             Adw.Application.do_startup(self)
             Gtk.Window.set_default_icon_name(APP_ID)
-            icons = Path(__file__).resolve().parent / "data" / "icons"
-            if icons.is_dir():
+            icons = icon_dir()
+            if icons:
                 Gtk.IconTheme.get_for_display(Gdk.Display.get_default()).add_search_path(str(icons))
-            for action in (plain_action("quit", self.quit), plain_action("refresh", self.refresh),
+            for action in (plain_action("quit", self.request_quit), plain_action("refresh", self.refresh),
                            plain_action("preferences", self.show_preferences), plain_action("about", self.show_about),
-                           plain_action("show", self.show_window), target_action("sign-in", self.sign_in_from_notification)):
+                           plain_action("show", self.show_window), plain_action("pick-identity", self.open_picker),
+                           target_action("sign-in", self.sign_in_from_notification)):
                 self.add_action(action)
             self.set_accels_for_action("app.quit", ["<Control>q"])
             self.set_accels_for_action("app.refresh", ["<Control>r", "F5"])
@@ -773,7 +1325,14 @@ def gui(background=False, smoke_test=False):
             self.set_accels_for_action("window.close", ["<Control>w"])
             if self.start_hidden or self.settings["background"]:
                 self.set_held(True)
+            if self.settings["kcm"]:
+                self.start_kcm()
+            self.tray = Tray(self)
             GLib.timeout_add_seconds(30, self.tick)
+
+        def do_shutdown(self):
+            self.stop_kcm()
+            Adw.Application.do_shutdown(self)
 
         def do_activate(self):
             if self.start_hidden:
@@ -789,6 +1348,12 @@ def gui(background=False, smoke_test=False):
                 self.window.update()
             self.window.present()
 
+        def toggle_window(self):
+            if self.window and self.window.get_visible() and self.window.is_active() and self.held:
+                self.window.set_visible(False)
+            else:
+                self.show_window()
+
         def set_held(self, held):
             """Keep running without a window (background renewal) or not."""
             if held and not self.held:
@@ -800,12 +1365,128 @@ def gui(background=False, smoke_test=False):
                     self.window = None
             self.held = held
 
+        def request_quit(self):
+            if not self.server:
+                self.quit()
+                return
+            dialog = Adw.AlertDialog(heading="Quit Kerberus?",
+                                     body="Apps can't get Kerberos tickets while Kerberus isn't running. "
+                                          "It starts again when you log in.")
+            dialog.add_response("cancel", "Cancel")
+            dialog.add_response("quit", "Quit")
+            dialog.set_response_appearance("quit", Adw.ResponseAppearance.DESTRUCTIVE)
+            dialog.set_close_response("cancel")
+            dialog.connect("response", lambda _d, response: response == "quit" and self.quit())
+            dialog.present(self.window if self.window and self.window.get_visible() else None)
+
+        # Kerberus as the credential cache
+
+        def start_kcm(self):
+            use_kcm(True)
+            self.store = KcmStore(KCM_STATE)
+            self.store.changed = lambda: GLib.idle_add(self.queue_refresh)
+            self.server = KcmServer(self.store, need_ticket=self.need_ticket,
+                                    log=lambda m: print(m, file=sys.stderr))
+            try:
+                self.server.start()
+                self.kcm_error = None
+            except (RuntimeError, OSError) as e:
+                self.server = None
+                self.kcm_error = f"Kerberus can't keep the tickets for apps: {e}"
+
+        def stop_kcm(self):
+            if self.server:
+                self.server.stop()
+            self.server = self.store = None
+            self.kcm_error = None
+            use_kcm(False)
+
+        def set_kcm(self, enabled):
+            self.set_setting("kcm", enabled)
+            set_session_kcm(enabled)
+            if enabled:
+                self.start_kcm()
+                set_autostart(True)
+                self.set_setting("background", True)
+            else:
+                self.stop_kcm()
+            self.refresh()
+
+        def need_ticket(self, client, name):
+            """An app asked for a cache with no valid ticket. Runs on the KCM
+            connection's thread, which holds the app's request until this returns."""
+            settings = self.settings
+            if client.program in settings["ignored_apps"] or time.time() < self.snoozed.get(client.program, 0):
+                return
+            principal, cache = self.store.describe(name)
+            with self.recover_lock:
+                if not self.store.needs_sign_in(name):
+                    return  # another request already got one
+                if principal and recover_quietly(principal, cache, settings, self.keyring, self.failed):
+                    return
+            with self.prompt_lock:
+                request = self.prompt
+                if request is None:
+                    request = self.prompt = PromptRequest(client, principal, cache)
+                    GLib.idle_add(self.show_prompt, request)
+            if DEBUG:
+                print(f"prompt: {client.program}[{client.pid}] waits for {id(request):x}", file=sys.stderr)
+            answered = request.done.wait(settings["prompt_timeout"])
+            if DEBUG:
+                print(f"prompt: {client.program}[{client.pid}] {'answered' if answered else 'timed out'}", file=sys.stderr)
+
+        def show_prompt(self, request):
+            if self.picker:
+                self.picker.attach(request)
+            else:
+                self.picker = IdentityPicker(self, request)
+            self.picker.present()
+            self.update_tray()
+            return False
+
+        def open_picker(self, principal=None):
+            if not self.picker:
+                self.picker = IdentityPicker(self, None)
+            self.picker.present()
+
+        def prompt_finished(self, request, outcome):
+            """outcome: "signed-in", "cancelled" (ask again in 5 minutes) or "ignore" (never ask this app)."""
+            self.picker = None
+            if DEBUG:
+                print(f"prompt: {id(request):x} finished: {outcome}", file=sys.stderr)
+            if request:
+                program = request.client.program
+                if outcome == "cancelled":
+                    self.snoozed[program] = time.time() + 300
+                elif outcome == "ignore" and program not in self.settings["ignored_apps"]:
+                    self.set_setting("ignored_apps", self.settings["ignored_apps"] + [program])
+                with self.prompt_lock:
+                    if self.prompt is request:
+                        self.prompt = None
+                request.done.set()
+            self.refresh()
+
+        # Tickets
+
         def tick(self):
             self.refresh(then=self.maintain)
             return True
 
+        def queue_refresh(self):
+            """Refresh soon; for bursts of changes (an app storing service tickets)."""
+            if not self.refresh_queued:
+                self.refresh_queued = True
+
+                def run():
+                    self.refresh_queued = False
+                    self.refresh()
+                    return False
+                GLib.timeout_add(400, run)
+            return False
+
         def refresh(self, then=None):
             if self.refreshing:
+                self.refresh_again = True
                 return
             self.refreshing = True
 
@@ -823,9 +1504,19 @@ def gui(background=False, smoke_test=False):
                     (self.caches, self.saved), self.error = result, None
                 if self.window:
                     self.window.update()
+                if self.picker:
+                    self.picker.refreshed()
+                self.update_tray()
                 if then:
                     then()
+                if self.refresh_again:
+                    self.refresh_again = False
+                    self.refresh()
             in_thread(work, done)
+
+        def update_tray(self):
+            if self.tray:
+                self.tray.update()
 
         def maintain(self):
             if self.maintaining or not self.caches:
@@ -846,6 +1537,11 @@ def gui(background=False, smoke_test=False):
                     self.refresh()
             in_thread(lambda: maintain(caches, settings, self.keyring, log=changed.append, failed=self.failed), done)
 
+        def renew_all(self):
+            now = dt.datetime.now()
+            caches = [c for c in self.caches if c.can_renew(now)]
+            in_thread(lambda: [renew(c) for c in caches], lambda _results: self.refresh())
+
         def send_ticket_notice(self, cache, text):
             note = Gio.Notification.new("Kerberos ticket")
             note.set_body(text)
@@ -853,11 +1549,26 @@ def gui(background=False, smoke_test=False):
             note.add_button_with_target("Sign In…", "app.sign-in", GLib.Variant("s", cache.principal))
             self.send_notification(f"ticket-{cache.principal}", note)
 
+        def identities(self):
+            """Principals to offer when signing in: recent ones, saved passwords, current caches."""
+            seen = []
+            for principal in self.settings["identities"] + sorted(self.saved) + [c.principal for c in self.caches]:
+                if principal and principal not in seen:
+                    seen.append(principal)
+            return seen
+
         def signed_in(self, principal):
             self.failed.discard(principal)
             self.withdraw_notification(f"ticket-{principal}")
             self.settings["last_principal"] = principal
+            self.settings["identities"] = ([principal] + [p for p in self.settings["identities"] if p != principal])[:8]
             save_settings(self.settings)
+
+        def forget_identity(self, principal):
+            self.settings["identities"] = [p for p in self.settings["identities"] if p != principal]
+            save_settings(self.settings)
+            self.saved.discard(principal)
+            in_thread(lambda: self.keyring.forget(principal), lambda _found: self.refresh())
 
         def sign_in_from_notification(self, principal):
             self.show_window()
@@ -885,6 +1596,8 @@ def gui(background=False, smoke_test=False):
                             f"libadwaita {Adw.get_major_version()}.{Adw.get_minor_version()}."
                             f"{Adw.get_micro_version()}, GTK {Gtk.get_major_version()}.{Gtk.get_minor_version()}."
                             f"{Gtk.get_micro_version()}\nKRB5CCNAME={os.environ.get('KRB5CCNAME', '')}\n"
+                            f"Credential cache server: {KCM_SOCKET if self.server else 'off'}\n"
+                            f"Tray: {'registered' if self.tray and self.tray.registered else 'no StatusNotifierWatcher'}\n"
                             f"Keyring: {'yes' if self.keyring.available else 'no'}"))
             about.present(self.window)
 
@@ -911,6 +1624,7 @@ def gui(background=False, smoke_test=False):
                                          action_name="win.get-ticket"))
             menu = Gio.Menu()
             tickets = Gio.Menu()
+            tickets.append("Choose Identity…", "app.pick-identity")
             tickets.append("Change Password…", "win.change-password-default")
             tickets.append("Destroy All Tickets…", "win.destroy-all")
             menu.append_section(None, tickets)
@@ -943,6 +1657,9 @@ def gui(background=False, smoke_test=False):
             self.toasts = Adw.ToastOverlay(child=self.stack)
             view = Adw.ToolbarView(content=self.toasts)
             view.add_top_bar(header)
+            self.banner = Adw.Banner()
+            self.banner.connect("button-clicked", self.banner_clicked)
+            view.add_top_bar(self.banner)
             self.set_content(view)
             self.connect("close-request", self.on_close)
 
@@ -979,6 +1696,41 @@ def gui(background=False, smoke_test=False):
                 self.stack.set_visible_child_name("list")
             default = find_cache(caches, None)
             self.title_widget.set_subtitle(default.principal if default else "")
+            self.update_banner()
+
+        def update_banner(self):
+            settings, title, button = self.app.settings, None, None
+            if self.app.kcm_error:
+                title = self.app.kcm_error
+            elif not settings["kcm"] and not settings["kcm_offer_dismissed"]:
+                title, button = "Kerberus can ask you to sign in whenever an app needs a Kerberos ticket", "Turn On…"
+            elif settings["kcm"] and os.environ.get("KRB5CCNAME") != "KCM:":
+                title = "Log out and back in so that apps ask Kerberus for their tickets"
+            if title:
+                self.banner.set_title(esc(title))
+                self.banner.set_button_label(button)
+            self.banner.set_revealed(bool(title))
+
+        def banner_clicked(self, _banner):
+            dialog = Adw.AlertDialog(
+                heading="Ask When Apps Need a Ticket?",
+                body="Kerberus becomes your session's Kerberos credential cache. When a browser, file manager or "
+                     "other app needs a ticket and you don't have one, Kerberus asks which identity to sign in as, "
+                     "and the app carries on once you have.\n\nKerberus will start at login and keep running in "
+                     "the background. Log out and back in afterwards. You can turn this off in Preferences.")
+            dialog.add_response("later", "Not Now")
+            dialog.add_response("on", "Turn On")
+            dialog.set_response_appearance("on", Adw.ResponseAppearance.SUGGESTED)
+            dialog.set_close_response("later")
+
+            def response(_dialog, answer):
+                if answer == "on":
+                    self.app.set_kcm(True)
+                else:
+                    self.app.set_setting("kcm_offer_dismissed", True)
+                self.update_banner()
+            dialog.connect("response", response)
+            dialog.present(self)
 
         def cache_named(self, name):
             return next((c for c in self.app.caches if c.name == name), None)
@@ -1314,12 +2066,518 @@ def gui(background=False, smoke_test=False):
                     self.on_changed(new)
             in_thread(work, done)
 
+    class IdentityPicker(Adw.Window):
+        """Choose who to sign in as: for an app that's waiting on a ticket, or from the tray."""
+
+        def __init__(self, app, request):
+            super().__init__(application=app, title="Kerberos Sign-In", default_width=440, default_height=620)
+            self.app, self.request = app, None
+            self.principal = None     # whose password the password page asks for (None: typed in)
+            self.busy = False
+            self.outcome = "cancelled"
+            self.banner_handler = None
+
+            header = Adw.HeaderBar()
+            self.back = Gtk.Button(icon_name="go-previous-symbolic", tooltip_text="Back", visible=False)
+            self.back.connect("clicked", lambda *_: self.show_choices())
+            header.pack_start(self.back)
+            self.spinner = Gtk.Spinner()
+            header.pack_end(self.spinner)
+            self.banner = Adw.Banner()
+            self.stack = Gtk.Stack(transition_type=Gtk.StackTransitionType.SLIDE_LEFT_RIGHT)
+
+            choose = Adw.PreferencesPage()
+            intro = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+            self.app_icon = Gtk.Image(pixel_size=64)
+            self.heading = Gtk.Label(wrap=True, justify=Gtk.Justification.CENTER)
+            self.heading.add_css_class("title-2")
+            self.subheading = Gtk.Label(wrap=True, justify=Gtk.Justification.CENTER)
+            self.subheading.add_css_class("dim-label")
+            for widget in (self.app_icon, self.heading, self.subheading):
+                intro.append(widget)
+            group = Adw.PreferencesGroup()
+            group.add(intro)
+            choose.add(group)
+            self.choices = Adw.PreferencesGroup(title="Identities")
+            self.choice_rows = []
+            choose.add(self.choices)
+            more = Adw.PreferencesGroup()
+            other = Adw.ActionRow(title="Use Another Identity…", activatable=True)
+            other.add_prefix(Gtk.Image(icon_name="list-add-symbolic"))
+            other.add_suffix(Gtk.Image(icon_name="go-next-symbolic"))
+            other.connect("activated", lambda *_: self.show_password(None))
+            more.add(other)
+            self.dont_ask = Adw.SwitchRow(use_markup=False)
+            more.add(self.dont_ask)
+            choose.add(more)
+            self.stack.add_named(choose, "choose")
+
+            password_page = Adw.PreferencesPage()
+            who = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+            self.avatar = Adw.Avatar(size=80, show_initials=True, halign=Gtk.Align.CENTER)
+            self.who = Gtk.Label(wrap=True, justify=Gtk.Justification.CENTER)
+            self.who.add_css_class("title-3")
+            who.append(self.avatar)
+            who.append(self.who)
+            group = Adw.PreferencesGroup()
+            group.add(who)
+            password_page.add(group)
+            fields = Adw.PreferencesGroup()
+            self.principal_row = Adw.EntryRow(title="Principal")
+            self.password_row = Adw.PasswordEntryRow(title="Password")
+            self.remember_row = Adw.SwitchRow(title="Remember Password",
+                                              subtitle="Sign in again by itself when the ticket can't be renewed",
+                                              visible=app.keyring.available)
+            for row in (self.principal_row, self.password_row, self.remember_row):
+                fields.add(row)
+            for row in (self.principal_row, self.password_row):
+                row.connect("changed", lambda *_: self.validate())
+                row.connect("entry-activated", lambda *_: self.sign_in_button.get_sensitive() and self.submit())
+            password_page.add(fields)
+            self.sign_in_button = Gtk.Button(label="Sign In", halign=Gtk.Align.CENTER)
+            self.sign_in_button.add_css_class("pill")
+            self.sign_in_button.add_css_class("suggested-action")
+            self.sign_in_button.connect("clicked", lambda *_: self.submit())
+            group = Adw.PreferencesGroup()
+            group.add(self.sign_in_button)
+            password_page.add(group)
+            self.stack.add_named(password_page, "password")
+
+            self.toasts = Adw.ToastOverlay(child=self.stack)
+            view = Adw.ToolbarView(content=self.toasts)
+            view.add_top_bar(header)
+            view.add_top_bar(self.banner)
+            self.set_content(view)
+            keys = Gtk.ShortcutController()
+            keys.add_shortcut(Gtk.Shortcut.new(Gtk.ShortcutTrigger.parse_string("Escape"),
+                                               Gtk.CallbackAction.new(lambda *_: self.close() or True)))
+            self.add_controller(keys)
+            self.connect("close-request", self.on_close)
+            self.attach(request)
+
+        def attach(self, request):
+            """Show who's waiting (an app's request), or a plain sign-in when nobody is."""
+            self.request = request or self.request
+            if self.request:
+                info = app_info_for(self.request.client.program)
+                name = info.get_display_name() if info else self.request.client.program.capitalize()
+                icon = info.get_icon() if info else None
+                if icon:
+                    self.app_icon.set_from_gicon(icon)
+                else:
+                    self.app_icon.set_from_icon_name(APP_ID)
+                self.heading.set_text(f"{name} Wants to Sign In")
+                self.subheading.set_text(f"{name} needs a Kerberos ticket and is waiting for you to choose "
+                                         "who to sign in as.")
+                self.dont_ask.set_title(f"Don't Ask for {name} Again")
+                self.dont_ask.set_visible(True)
+            else:
+                self.app_icon.set_from_icon_name(APP_ID)
+                self.heading.set_text("Sign In")
+                self.subheading.set_text("Choose an identity to get a Kerberos ticket.")
+                self.dont_ask.set_visible(False)
+            if not self.busy:
+                self.fill()
+
+        def fill(self, navigate=True):
+            for row in self.choice_rows:
+                self.choices.remove(row)
+            self.choice_rows = []
+            people = self.app.identities()
+            wanted = self.request.principal if self.request else ""
+            if wanted:
+                people = [wanted] + [p for p in people if p != wanted]
+            now = dt.datetime.now()
+            for principal in people:
+                user, _, realm = principal.rpartition("@")
+                notes = [realm] if user else []
+                cache = next((c for c in self.app.caches if c.principal == principal), None)
+                if cache:
+                    notes.append("ticket expired" if cache.state(now) == "expired" else "signed in")
+                if principal in self.app.saved:
+                    notes.append("password saved")
+                row = Adw.ActionRow(title=user or principal, subtitle=" · ".join(notes), activatable=True,
+                                    use_markup=False)
+                row.add_prefix(Adw.Avatar(size=40, text=principal, show_initials=True))
+                row.add_suffix(Gtk.Image(icon_name="go-next-symbolic"))
+                row.connect("activated", lambda _row, p=principal: self.choose(p))
+                self.choices.add(row)
+                self.choice_rows.append(row)
+            self.choices.set_visible(bool(people))
+            if not navigate:
+                return
+            if people:
+                self.show_choices()
+            else:
+                self.show_password(None)
+
+        def refreshed(self):
+            """The ticket list changed; update the rows if they're what's showing."""
+            if not self.busy and self.stack.get_visible_child_name() == "choose":
+                self.fill(navigate=False)
+
+        def show_choices(self):
+            self.banner.set_revealed(False)
+            self.back.set_visible(False)
+            self.stack.set_visible_child_name("choose")
+
+        def choose(self, principal):
+            self.show_password(principal)
+            if principal in self.app.saved and principal not in self.app.failed:
+                self.submit(use_saved=True)
+
+        def show_password(self, principal):
+            self.principal = principal
+            self.banner.set_revealed(False)
+            self.principal_row.set_visible(principal is None)
+            if principal is None:
+                self.principal_row.set_text(self.app.settings["last_principal"] or full_principal(getpass.getuser()))
+            self.avatar.set_text(principal or "")
+            self.who.set_text(principal or "Another Identity")
+            self.password_row.set_text("")
+            self.remember_row.set_active(principal in self.app.saved)
+            self.back.set_visible(bool(self.choice_rows))
+            self.stack.set_visible_child_name("password")
+            self.validate()
+            self.set_focus(self.principal_row if principal is None else self.password_row)
+
+        def validate(self):
+            principal = self.principal or self.principal_row.get_text().strip()
+            self.sign_in_button.set_sensitive(not self.busy and bool(principal) and bool(self.password_row.get_text()))
+
+        def set_busy(self, busy):
+            self.busy = busy
+            self.spinner.set_spinning(busy)
+            self.back.set_sensitive(not busy)
+            self.sign_in_button.set_label("Signing In…" if busy else "Sign In")
+            self.validate()
+
+        def toast(self, text):
+            self.toasts.add_toast(Adw.Toast.new(text))
+
+        def show_error(self, text, button=None, callback=None):
+            self.banner.set_title(esc(text))
+            self.banner.set_button_label(button)
+            if self.banner_handler:
+                self.banner.disconnect(self.banner_handler)
+                self.banner_handler = None
+            if callback:
+                self.banner_handler = self.banner.connect("button-clicked", lambda *_: callback())
+            self.banner.set_revealed(True)
+
+        def submit(self, use_saved=False):
+            principal = self.principal or full_principal(self.principal_row.get_text())
+            password = None if use_saved else self.password_row.get_text()
+            remember = self.remember_row.get_active() and self.app.keyring.available
+            was_saved = principal in self.app.saved
+            # Sign in to the cache the waiting app asked for, so its request finds the ticket.
+            cache = f"KCM:{self.request.cache}" if self.request and self.app.server else None
+            settings, keyring = dict(self.app.settings), self.app.keyring
+            self.set_busy(True)
+            self.banner.set_revealed(False)
+
+            def work():
+                secret = password if password is not None else keyring.lookup(principal)
+                if secret is None:
+                    return Result(False, "The keyring didn't give back the saved password. Type it instead.")
+                result = get_ticket(principal, secret, cache=cache, **ticket_options(settings))
+                if result.ok and cache:
+                    run_tool("kswitch", "-c", cache)
+                if result.ok and password is not None:
+                    if remember:
+                        error = keyring.store(principal, password)
+                        if error:
+                            result.message += f" (could not save the password: {error})"
+                    elif was_saved:
+                        keyring.forget(principal)
+                return result
+
+            def done(result):
+                self.set_busy(False)
+                if result.ok:
+                    self.outcome = "signed-in"
+                    self.app.signed_in(principal)
+                    self.close()
+                    return
+                if use_saved:
+                    self.app.failed.add(principal)  # don't try that password again by itself
+                if result.password_expired:
+                    self.show_error(result.message, "Change Password", lambda: ChangePasswordDialog(
+                        self, principal, on_changed=self.changed).present(self))
+                else:
+                    self.show_error(result.message)
+                self.set_focus(self.password_row)
+            in_thread(work, done)
+
+        def changed(self, new_password):
+            self.password_row.set_text(new_password)
+            self.submit()
+
+        def on_close(self, _window):
+            if self.busy:
+                return True
+            outcome = self.outcome
+            if outcome == "cancelled" and self.request and self.dont_ask.get_active():
+                outcome = "ignore"
+            self.app.prompt_finished(self.request, outcome)
+            return False
+
+    SNI_XML = """<node><interface name="org.kde.StatusNotifierItem">
+      <property name="Category" type="s" access="read"/>
+      <property name="Id" type="s" access="read"/>
+      <property name="Title" type="s" access="read"/>
+      <property name="Status" type="s" access="read"/>
+      <property name="WindowId" type="i" access="read"/>
+      <property name="IconName" type="s" access="read"/>
+      <property name="IconPixmap" type="a(iiay)" access="read"/>
+      <property name="OverlayIconName" type="s" access="read"/>
+      <property name="AttentionIconName" type="s" access="read"/>
+      <property name="IconThemePath" type="s" access="read"/>
+      <property name="ToolTip" type="(sa(iiay)ss)" access="read"/>
+      <property name="ItemIsMenu" type="b" access="read"/>
+      <property name="Menu" type="o" access="read"/>
+      <method name="ContextMenu"><arg name="x" type="i" direction="in"/><arg name="y" type="i" direction="in"/></method>
+      <method name="Activate"><arg name="x" type="i" direction="in"/><arg name="y" type="i" direction="in"/></method>
+      <method name="SecondaryActivate"><arg name="x" type="i" direction="in"/><arg name="y" type="i" direction="in"/></method>
+      <method name="Scroll"><arg name="delta" type="i" direction="in"/><arg name="orientation" type="s" direction="in"/></method>
+      <signal name="NewTitle"/><signal name="NewIcon"/><signal name="NewAttentionIcon"/><signal name="NewToolTip"/>
+      <signal name="NewStatus"><arg name="status" type="s"/></signal>
+    </interface></node>"""
+    MENU_XML = """<node><interface name="com.canonical.dbusmenu">
+      <property name="Version" type="u" access="read"/>
+      <property name="TextDirection" type="s" access="read"/>
+      <property name="Status" type="s" access="read"/>
+      <property name="IconThemePath" type="as" access="read"/>
+      <method name="GetLayout"><arg type="i" name="parentId" direction="in"/><arg type="i" name="recursionDepth" direction="in"/>
+        <arg type="as" name="propertyNames" direction="in"/><arg type="u" name="revision" direction="out"/>
+        <arg type="(ia{sv}av)" name="layout" direction="out"/></method>
+      <method name="GetGroupProperties"><arg type="ai" name="ids" direction="in"/><arg type="as" name="propertyNames" direction="in"/>
+        <arg type="a(ia{sv})" name="properties" direction="out"/></method>
+      <method name="GetProperty"><arg type="i" name="id" direction="in"/><arg type="s" name="name" direction="in"/>
+        <arg type="v" name="value" direction="out"/></method>
+      <method name="Event"><arg type="i" name="id" direction="in"/><arg type="s" name="eventId" direction="in"/>
+        <arg type="v" name="data" direction="in"/><arg type="u" name="timestamp" direction="in"/></method>
+      <method name="EventGroup"><arg type="a(isvu)" name="events" direction="in"/><arg type="ai" name="idErrors" direction="out"/></method>
+      <method name="AboutToShow"><arg type="i" name="id" direction="in"/><arg type="b" name="needUpdate" direction="out"/></method>
+      <method name="AboutToShowGroup"><arg type="ai" name="ids" direction="in"/><arg type="ai" name="updatesNeeded" direction="out"/>
+        <arg type="ai" name="idErrors" direction="out"/></method>
+      <signal name="ItemsPropertiesUpdated"><arg type="a(ia{sv})" name="updatedProps"/><arg type="a(ias)" name="removedProps"/></signal>
+      <signal name="LayoutUpdated"><arg type="u" name="revision"/><arg type="i" name="parent"/></signal>
+    </interface></node>"""
+
+    class Tray:
+        """The tray icon: a StatusNotifierItem (shown by KDE, GNOME with the AppIndicator
+        extension, waybar and others) with a com.canonical.dbusmenu menu."""
+
+        def __init__(self, app):
+            self.app = app
+            self.registered = self.owned = False
+            self.watcher = None
+            self.status, self.icon, self.tooltip = "Active", APP_ID, ""
+            self.entries = []         # (label, enabled, callback); None is a separator
+            self.revision = 0
+            self.pixmaps = {}
+            self.conn = app.get_dbus_connection()
+            if self.conn is None:
+                return
+            self.bus_name = f"org.kde.StatusNotifierItem-{os.getpid()}-1"
+            self.conn.register_object("/StatusNotifierItem", Gio.DBusNodeInfo.new_for_xml(SNI_XML).interfaces[0],
+                                      self.item_call, self.item_property, None)
+            self.conn.register_object("/MenuBar", Gio.DBusNodeInfo.new_for_xml(MENU_XML).interfaces[0],
+                                      self.menu_call, self.menu_property, None)
+            Gio.bus_own_name_on_connection(self.conn, self.bus_name, Gio.BusNameOwnerFlags.NONE,
+                                           self.name_acquired, None)
+            Gio.bus_watch_name_on_connection(self.conn, "org.kde.StatusNotifierWatcher",
+                                             Gio.BusNameWatcherFlags.NONE, self.watcher_appeared, self.watcher_vanished)
+            self.update()
+
+        def name_acquired(self, _conn, _name):
+            self.owned = True
+            self.register()
+
+        def watcher_appeared(self, _conn, name, _owner):
+            self.watcher = name
+            self.register()
+
+        def watcher_vanished(self, _conn, _name):
+            self.watcher, self.registered = None, False
+
+        def register(self):
+            if not (self.owned and self.watcher):
+                return
+
+            def finished(conn, result):
+                try:
+                    conn.call_finish(result)
+                    self.registered = True
+                except GLib.Error as e:
+                    print(f"Tray icon not registered: {e.message}", file=sys.stderr)
+            self.conn.call(self.watcher, "/StatusNotifierWatcher", "org.kde.StatusNotifierWatcher",
+                           "RegisterStatusNotifierItem", GLib.Variant("(s)", (self.bus_name,)), None,
+                           Gio.DBusCallFlags.NONE, -1, None, finished)
+
+        def pixmap(self, name):
+            """The icon as ARGB32 images, for hosts that don't look icons up by name."""
+            if name not in self.pixmaps:
+                from gi.repository import GdkPixbuf
+                images = []
+                path = (icon_dir() or Path()) / "hicolor" / "scalable" / "apps" / f"{name}.svg"
+                for size in (22, 32, 48):
+                    try:
+                        pixbuf = GdkPixbuf.Pixbuf.new_from_file_at_size(str(path), size, size)
+                    except GLib.Error:
+                        break
+                    if not pixbuf.get_has_alpha():
+                        pixbuf = pixbuf.add_alpha(False, 0, 0, 0)
+                    w, h, stride, pixels = pixbuf.get_width(), pixbuf.get_height(), pixbuf.get_rowstride(), pixbuf.get_pixels()
+                    rgba = b"".join(pixels[y * stride:y * stride + w * 4] for y in range(h))
+                    argb = bytearray(len(rgba))
+                    argb[0::4], argb[1::4], argb[2::4], argb[3::4] = rgba[3::4], rgba[0::4], rgba[1::4], rgba[2::4]
+                    images.append((w, h, bytes(argb)))
+                self.pixmaps[name] = images
+            return self.pixmaps[name]
+
+        def update(self):
+            app, now = self.app, dt.datetime.now()
+            warn = app.settings["notify_before"]
+            entries, tips = [], []
+            for cache in app.caches:
+                t = cache.tgt
+                state = cache.state(now, warn)
+                text = ("expired" if state == "expired" or t is None
+                        else f"{fmt_duration((t.expires - now).total_seconds())} left")
+                entries.append((f"{cache.principal}: {text}", False, None))
+                tips.append(f"{cache.principal}: {text}")
+            if not app.caches:
+                entries.append(("Not signed in", False, None))
+            entries += [None,
+                        ("Choose Identity…", True, app.open_picker),
+                        ("Renew Tickets", any(c.can_renew(now) for c in app.caches), app.renew_all),
+                        ("Open Kerberus", True, app.show_window),
+                        None,
+                        ("Quit", True, app.request_quit)]
+            states = [c.state(now, warn) for c in app.caches]
+            if app.prompt:
+                status, icon = "NeedsAttention", f"{APP_ID}-attention"
+                tips.insert(0, f"{app.prompt.client.program} is waiting for you to sign in")
+            elif not states or all(s == "expired" for s in states):
+                status, icon = "Active", f"{APP_ID}-inactive"
+            elif "expiring" in states or "expired" in states:
+                status, icon = "Active", f"{APP_ID}-attention"
+            else:
+                status, icon = "Active", APP_ID
+            tooltip = "\n".join(tips) or "Not signed in"
+            if self.conn is None:
+                return
+            if [e and e[:2] for e in entries] != [e and e[:2] for e in self.entries]:
+                self.revision += 1
+                self.entries = entries
+                self.conn.emit_signal(None, "/MenuBar", "com.canonical.dbusmenu", "LayoutUpdated",
+                                      GLib.Variant("(ui)", (self.revision, 0)))
+            else:
+                self.entries = entries  # same layout, fresh callbacks
+            if icon != self.icon:
+                self.icon = icon
+                self.conn.emit_signal(None, "/StatusNotifierItem", "org.kde.StatusNotifierItem", "NewIcon", None)
+            if status != self.status:
+                self.status = status
+                self.conn.emit_signal(None, "/StatusNotifierItem", "org.kde.StatusNotifierItem", "NewStatus",
+                                      GLib.Variant("(s)", (status,)))
+            if tooltip != self.tooltip:
+                self.tooltip = tooltip
+                self.conn.emit_signal(None, "/StatusNotifierItem", "org.kde.StatusNotifierItem", "NewToolTip", None)
+
+        def item_property(self, _conn, _sender, _path, _iface, name):
+            values = {
+                "Category": ("s", "ApplicationStatus"), "Id": ("s", "kerberus"), "Title": ("s", APP_NAME),
+                "Status": ("s", self.status), "WindowId": ("i", 0), "IconName": ("s", self.icon),
+                "IconPixmap": ("a(iiay)", self.pixmap(self.icon)), "OverlayIconName": ("s", ""),
+                "AttentionIconName": ("s", f"{APP_ID}-attention"), "IconThemePath": ("s", str(icon_dir() or "")),
+                "ToolTip": ("(sa(iiay)ss)", (self.icon, [], APP_NAME, self.tooltip)),
+                "ItemIsMenu": ("b", False), "Menu": ("o", "/MenuBar"),
+            }
+            return GLib.Variant(*values[name]) if name in values else None
+
+        def item_call(self, _conn, _sender, _path, _iface, method, _params, invocation):
+            if method == "Activate":
+                self.app.toggle_window()
+            elif method == "SecondaryActivate":
+                self.app.open_picker()
+            invocation.return_value(None)
+
+        def menu_property(self, _conn, _sender, _path, _iface, name):
+            values = {"Version": ("u", 3), "TextDirection": ("s", "ltr"), "Status": ("s", "normal"),
+                      "IconThemePath": ("as", [])}
+            return GLib.Variant(*values[name]) if name in values else None
+
+        def item_properties(self, item_id):
+            if item_id == 0:
+                return {"children-display": GLib.Variant("s", "submenu")}
+            entry = self.entries[item_id - 1]
+            if entry is None:
+                return {"type": GLib.Variant("s", "separator")}
+            return {"label": GLib.Variant("s", entry[0].replace("_", "__")), "enabled": GLib.Variant("b", entry[1])}
+
+        def layout(self, item_id):
+            children = []
+            if item_id == 0:
+                children = [GLib.Variant("(ia{sv}av)", (i, self.item_properties(i), []))
+                            for i in range(1, len(self.entries) + 1)]
+            return (item_id, self.item_properties(item_id), children)
+
+        def clicked(self, item_id):
+            if 1 <= item_id <= len(self.entries) and self.entries[item_id - 1] and self.entries[item_id - 1][2]:
+                GLib.idle_add(lambda: self.entries[item_id - 1][2]() and False)
+
+        def menu_call(self, _conn, _sender, _path, _iface, method, params, invocation):
+            args = params.unpack()
+            valid = range(0, len(self.entries) + 1)
+            if method == "GetLayout":
+                item_id = args[0] if args[0] in valid else 0
+                invocation.return_value(GLib.Variant("(u(ia{sv}av))", (self.revision, self.layout(item_id))))
+            elif method == "GetGroupProperties":
+                ids = [i for i in (args[0] or valid) if i in valid]
+                invocation.return_value(GLib.Variant("(a(ia{sv}))", ([(i, self.item_properties(i)) for i in ids],)))
+            elif method == "GetProperty":
+                value = self.item_properties(args[0]).get(args[1]) if args[0] in valid else None
+                invocation.return_value(GLib.Variant("(v)", (value or GLib.Variant("s", ""),)))
+            elif method == "Event":
+                if args[1] == "clicked":
+                    self.clicked(args[0])
+                invocation.return_value(None)
+            elif method == "EventGroup":
+                for item_id, event, _data, _time in args[0]:
+                    if event == "clicked":
+                        self.clicked(item_id)
+                invocation.return_value(GLib.Variant("(ai)", ([],)))
+            elif method == "AboutToShow":
+                invocation.return_value(GLib.Variant("(b)", (False,)))
+            elif method == "AboutToShowGroup":
+                invocation.return_value(GLib.Variant("(aiai)", ([], [])))
+            else:
+                invocation.return_dbus_error("org.freedesktop.DBus.Error.UnknownMethod", method)
+
     class Preferences(Adw.PreferencesDialog):
         def __init__(self, app):
             super().__init__()
             self.app = app
             page = Adw.PreferencesPage(title="General", icon_name="preferences-system-symbolic")
             self.add(page)
+
+            prompts = Adw.PreferencesGroup(
+                title="Sign-In Prompts",
+                description="Kerberus keeps your session's Kerberos tickets and, when an app needs one you don't "
+                            "have, asks which identity to sign in as. Log out and back in after changing this.")
+            self.kcm_row = Adw.SwitchRow(title="Ask When Apps Need a Ticket", active=app.settings["kcm"])
+            self.kcm_row.connect("notify::active", self.kcm_changed)
+            prompts.add(self.kcm_row)
+            timeout = self.spin("prompt_timeout", "Apps Wait For", "Seconds before an app gives up waiting", 15, 600, 15)
+            prompts.add(timeout)
+            self.ignored = Adw.ExpanderRow(title="Apps That Never Ask", use_markup=False)
+            prompts.add(self.ignored)
+            self.ignored_rows = []
+            self.fill_ignored()
+            page.add(prompts)
 
             renewal = Adw.PreferencesGroup(title="Renewal")
             renewal.add(self.switch("auto_renew", "Renew Automatically", "Renew tickets before they expire"))
@@ -1337,17 +2595,19 @@ def gui(background=False, smoke_test=False):
 
             running = Adw.PreferencesGroup(title="Background",
                                            description="Tickets are only renewed while Kerberus is running.")
-            running.add(self.switch("background", "Run in Background", "Keep renewing after the window is closed"))
-            autostart = Adw.SwitchRow(title="Start at Login", subtitle="In the background",
-                                      active=autostart_enabled())
-            autostart.connect("notify::active", lambda row, _p: set_autostart(row.get_active()))
-            running.add(autostart)
+            self.background_row = self.switch("background", "Run in Background",
+                                              "Keep running in the tray after the window is closed")
+            running.add(self.background_row)
+            self.autostart_row = Adw.SwitchRow(title="Start at Login", subtitle="In the background",
+                                               active=autostart_enabled())
+            self.autostart_row.connect("notify::active", lambda row, _p: set_autostart(row.get_active()))
+            running.add(self.autostart_row)
             page.add(running)
 
-            self.passwords = Adw.PreferencesGroup(title="Saved Passwords")
-            page.add(self.passwords)
-            self.password_rows = []
-            self.fill_passwords()
+            self.people = Adw.PreferencesGroup(title="Identities")
+            page.add(self.people)
+            self.people_rows = []
+            self.fill_identities()
 
         def switch(self, key, title, subtitle):
             row = Adw.SwitchRow(title=title, subtitle=subtitle, active=self.app.settings[key])
@@ -1362,29 +2622,58 @@ def gui(background=False, smoke_test=False):
             row.connect("notify::value", lambda r, _p: self.app.set_setting(key, int(r.get_value())))
             return row
 
-        def fill_passwords(self):
-            for row in self.password_rows:
-                self.passwords.remove(row)
-            self.password_rows = []
-            if not self.app.keyring.available:
-                self.passwords.set_description("No keyring is available (libsecret is missing).")
+        def kcm_changed(self, row, _param):
+            if row.get_active() == self.app.settings["kcm"]:
                 return
-            saved = sorted(self.app.saved)
-            self.passwords.set_description("" if saved else "Turn on Remember Password when you sign in to save one.")
-            for principal in saved:
-                row = Adw.ActionRow(title=principal, use_markup=False)
-                forget = Gtk.Button(label="Forget", valign=Gtk.Align.CENTER)
+            self.app.set_kcm(row.get_active())
+            # Prompts need Kerberus running, so turning them on turns these on too.
+            self.background_row.set_active(self.app.settings["background"])
+            self.autostart_row.set_active(autostart_enabled())
+            self.add_toast(Adw.Toast.new("Log out and back in for apps to pick this up"))
+
+        def fill_ignored(self):
+            for row in self.ignored_rows:
+                self.ignored.remove(row)
+            self.ignored_rows = []
+            ignored = self.app.settings["ignored_apps"]
+            self.ignored.set_visible(bool(ignored))
+            self.ignored.set_subtitle(", ".join(ignored))
+            for program in ignored:
+                info = app_info_for(program)
+                row = Adw.ActionRow(title=info.get_display_name() if info else program, use_markup=False)
+                again = Gtk.Button(label="Ask Again", valign=Gtk.Align.CENTER)
+                again.add_css_class("flat")
+                again.connect("clicked", self.ask_again, program)
+                row.add_suffix(again)
+                self.ignored.add_row(row)
+                self.ignored_rows.append(row)
+
+        def ask_again(self, _button, program):
+            self.app.set_setting("ignored_apps", [p for p in self.app.settings["ignored_apps"] if p != program])
+            self.fill_ignored()
+
+        def fill_identities(self):
+            for row in self.people_rows:
+                self.people.remove(row)
+            self.people_rows = []
+            people = self.app.identities()
+            self.people.set_description("" if people else "Identities you sign in as are listed here.")
+            for principal in people:
+                saved = principal in self.app.saved
+                row = Adw.ActionRow(title=principal, use_markup=False,
+                                    subtitle="Password saved in the keyring" if saved else "")
+                row.add_prefix(Adw.Avatar(size=32, text=principal, show_initials=True))
+                forget = Gtk.Button(label="Forget", valign=Gtk.Align.CENTER,
+                                    tooltip_text="Remove from the list" + (" and forget the password" if saved else ""))
                 forget.add_css_class("flat")
                 forget.connect("clicked", self.forget, principal)
                 row.add_suffix(forget)
-                self.passwords.add(row)
-                self.password_rows.append(row)
+                self.people.add(row)
+                self.people_rows.append(row)
 
         def forget(self, _button, principal):
-            self.app.keyring.forget(principal)
-            self.app.saved.discard(principal)
-            self.fill_passwords()
-            self.app.refresh()
+            self.app.forget_identity(principal)
+            self.fill_identities()
 
     app = App()
     if not smoke_test:
@@ -1394,6 +2683,8 @@ def gui(background=False, smoke_test=False):
     # Any exception in a callback fails the run.
     errors = []
     sys.excepthook = lambda *exc: (errors.append(exc), sys.__excepthook__(*exc))
+    globals()["save_settings"] = lambda _settings: None  # leave the real settings alone
+    app.settings = dict(DEFAULT_SETTINGS, identities=["carol@EXAMPLE.TEST"])
     now = dt.datetime.now()
 
     def stamp(t):
@@ -1423,6 +2714,22 @@ def gui(background=False, smoke_test=False):
         if dialog:
             dialog.force_close()
 
+    def close_picker():
+        if app.picker:
+            app.picker.close()
+
+    def check_tray():
+        tray = app.tray
+        tray.update()
+        layout = tray.layout(0)
+        labels = [child.unpack()[1].get("label") for child in layout[2]]
+        assert "Choose Identity…" in labels and "Quit" in labels, labels
+        assert tray.pixmap(tray.icon), f"no pixmap for {tray.icon}"
+        for name in ("IconName", "ToolTip", "Menu", "Status"):
+            assert tray.item_property(None, None, None, None, name) is not None, name
+
+    waiting = PromptRequest(KcmClient(1, "firefox", False), "bob@EXAMPLE.TEST", "0")
+
     def start():
         app.caches, app.saved, app.error = sample, {"alice@EXAMPLE.TEST"}, None
         app.show_window()
@@ -1433,6 +2740,10 @@ def gui(background=False, smoke_test=False):
             app.show_preferences, close_dialog,
             app.show_about, close_dialog,
             app.window.confirm_destroy_all, close_dialog,
+            lambda: (setattr(app, "prompt", waiting), app.show_prompt(waiting)), check_tray,
+            lambda: app.picker.show_password("bob@EXAMPLE.TEST"), lambda: app.picker.show_password(None),
+            lambda: app.picker.show_choices(), close_picker,
+            lambda: app.open_picker(), check_tray, close_picker,
             lambda: (setattr(app, "error", MISSING_TOOLS), app.window.update()),
             lambda: (setattr(app, "error", None), setattr(app, "caches", []), app.window.update()),
         ])
@@ -1479,6 +2790,8 @@ def main():
     watch = sub.add_parser("watch", help="renew tickets in the terminal, without a window")
     watch.add_argument("--interval", type=int, default=60, help="seconds between checks (default 60)")
     watch.add_argument("--once", action="store_true", help="check once and exit")
+    watch.add_argument("--kcm", action="store_true",
+                       help="also be the KCM credential cache (no sign-in prompts without the window)")
     args = parser.parse_args()
     if args.command is None:
         return gui(background=args.background, smoke_test=args.smoke_test)

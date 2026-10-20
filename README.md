@@ -1,13 +1,16 @@
 # Kerberus
 
-A GTK 4 / libadwaita app for Kerberos tickets: see what's in your credential
-caches, sign in, renew, switch principals, change your password and destroy
-tickets, and keep tickets renewed in the background so they don't run out in the
-middle of the day.
+A GTK 4 / libadwaita app for Kerberos tickets. It sits in the tray, keeps your
+tickets renewed so they don't run out in the middle of the day, and, when an app
+needs to sign in with Kerberos (a browser opening an intranet site, the file
+manager opening a Windows share, `ssh`, `smbclient`) and you don't have a
+ticket, pops up and asks which identity to sign in as. The app carries on once
+you have.
 
 <p align="center">
-  <img src="docs/screenshot.png" width="420" alt="The main window with two principals">
-  <img src="docs/sign-in.png" width="420" alt="Getting a ticket">
+  <img src="docs/prompt.png" width="300" alt="Firefox is waiting for you to choose an identity">
+  <img src="docs/screenshot.png" width="300" alt="The main window with two principals">
+  <img src="docs/sign-in.png" width="300" alt="Getting a ticket">
 </p>
 
 Kerberus drives the MIT Kerberos tools (`kinit`, `klist`, `kdestroy`, `kswitch`,
@@ -36,6 +39,52 @@ On NixOS, turn on `programs.appimage = { enable = true; binfmt = true; };` and
 run it as above, and add `krb5` to `environment.systemPackages` if you want the
 system's tools used rather than the bundled ones.
 
+## Sign-in prompts for apps
+
+Turn this on from the banner in the main window or *Preferences → Sign-In
+Prompts*, then log out and back in.
+
+Kerberos apps don't tell anyone when they want to sign in, but they all read
+their tickets from a credential cache, and MIT Kerberos has a cache type (`KCM:`)
+that is a daemon on a socket. With prompts on, Kerberus is that daemon for your
+session: it writes `~/.config/environment.d/60-kerberus.conf`, which gives every
+app started after you log in `KRB5CCNAME=KCM:` and a `KRB5_CONFIG` that puts
+`~/.config/kerberus/krb5.conf` (naming Kerberus's socket) in front of your
+system's `krb5.conf`. When an app asks for a ticket and there isn't a valid one,
+Kerberus first tries without bothering you (renewing, or the saved password of
+the identity that cache belonged to), and otherwise:
+
+- the sign-in window opens, naming the app, with the identities you've used
+  before. Click one and type its password (or nothing, if it's saved), or use
+  another identity;
+- the app's request waits meanwhile (two minutes by default, *Apps Wait For*),
+  then gets the ticket as though you'd been signed in all along;
+- **Cancel** (or Escape) answers the app straight away, and that app isn't asked
+  about again for five minutes. *Don't Ask for … Again* stops it for good
+  (undo it under *Apps That Never Ask*).
+
+The Kerberos tools themselves (`klist`, `kinit`, `kdestroy` …) never trigger a
+prompt. Tickets are kept in `$XDG_RUNTIME_DIR/kerberus/` (readable only by you,
+gone when you log out), so they survive Kerberus restarting. While Kerberus
+isn't running, apps can't get tickets at all, which is why turning prompts on
+also turns on *Start at Login* and *Run in Background*.
+
+Things to know:
+
+- **Browsers** only try Kerberos for sites you've allowed:
+  `network.negotiate-auth.trusted-uris` in Firefox's `about:config` (for example
+  `.example.com`), or the `AuthServerAllowlist` policy in Chrome and Chromium.
+- **NTLM.** Windows sign-in ("Negotiate") uses Kerberos when there's a ticket
+  and falls back to NTLM when there isn't. Kerberus sees and answers the
+  Kerberos attempt, which is what makes the fallback unnecessary. Apps that do
+  NTLM by themselves (Firefox's and Chrome's built-in NTLM, with their own
+  password dialogs) never go through anything Kerberus can see, so it can't
+  prompt for those.
+- **Flatpak and Snap apps** don't see the session's Kerberos settings, so they
+  aren't covered.
+- `KERBERUS_DEBUG=1 kerberus` logs every request apps make, with the program
+  that made it.
+
 ## Using it
 
 - **Get Ticket** (`Ctrl+N`) signs in with a password. *Remember Password* saves it
@@ -46,6 +95,12 @@ system's tools used rather than the bundled ones.
   default, changes its password, forgets its saved password or destroys its tickets.
 - If the password has expired, signing in offers to change it, then signs in with
   the new one.
+- **Tray icon.** The icon is grey when you're not signed in and gets an orange
+  badge when a ticket is about to expire or an app is waiting for you. Clicking it
+  shows or hides the window; its menu lists your tickets and has *Choose
+  Identity…*, *Renew Tickets*, *Open Kerberus* and *Quit*. The tray works on KDE,
+  in GNOME with the [AppIndicator extension](https://extensions.gnome.org/extension/615/appindicator-support/)
+  (Ubuntu ships it on), and in other StatusNotifierItem hosts such as waybar.
 
 **Renewal.** While it runs, Kerberus checks every 30 seconds. A renewable ticket is
 renewed when it has less than an hour left (*Preferences → Renew Ahead*), or half
@@ -56,8 +111,9 @@ so a changed password can't lock your account. Otherwise you get a notification
 before the ticket expires (*Warn Ahead*).
 
 **Background.** Tickets are only renewed while Kerberus is running. *Run in
-Background* keeps it running after the window is closed (quit from the menu or
-with `Ctrl+Q`), and *Start at Login* adds an autostart entry that starts it hidden.
+Background* (on by default) keeps it in the tray after the window is closed (quit
+from the tray, the menu or with `Ctrl+Q`), and *Start at Login* adds an autostart
+entry that starts it hidden.
 
 ### Command line
 
@@ -73,6 +129,7 @@ kerberus passwd [PRINCIPAL]
 kerberus destroy [PRINCIPAL | --all]
 kerberus forget PRINCIPAL               remove a saved password
 kerberus watch [--once]                 renew in the foreground (e.g. a systemd user service)
+kerberus watch --kcm                    ... and be the credential cache, without prompts
 kerberus --background                   start hidden and keep renewing
 ```
 
@@ -85,10 +142,11 @@ Settings live in `~/.config/kerberus/settings.json`.
 ## Releases
 
 [`.github/workflows/build.yml`](.github/workflows/build.yml) runs on every push and
-pull request: unit tests, integration tests against a throwaway KDC, the AppImage
-build, a smoke test of the window under Xvfb, and the integration tests again
-against the AppImage (with the host's Kerberos tools and with its own). The
-AppImage is uploaded as a workflow artifact.
+pull request: unit tests, integration tests against a throwaway KDC (with an
+ordinary cache and with Kerberus as the cache), the sign-in prompt and tray test,
+the AppImage build, a smoke test of the window under Xvfb, and the integration and
+prompt tests again against the AppImage (with the host's Kerberos tools and with
+its own). The AppImage is uploaded as a workflow artifact.
 
 A push to `main` that passes is released: the workflow tags the next version and
 publishes a GitHub release with the AppImage and its `.zsync`. The version comes
@@ -107,18 +165,25 @@ Markdown files and `LICENSE` alone don't start a build. The first release is 0.1
 
 Everything is in [`kerberus.py`](kerberus.py): the Kerberos tool wrappers and
 `klist` parsing, the renewal logic shared by the window and `kerberus watch`, the
-CLI, and the GUI. Run it from a checkout with the distro's PyGObject, GTK 4,
+KCM server (the protocol MIT's `cc_kcm.c` speaks), the CLI, and the GUI with its
+sign-in window and tray icon (a StatusNotifierItem with a `com.canonical.dbusmenu`
+menu, over GDBus). Run it from a checkout with the distro's PyGObject, GTK 4,
 libadwaita (1.5 or newer) and libsecret typelibs installed:
 
 ```sh
 python3 kerberus.py
 python3 -m unittest discover -s tests          # no KDC needed
 tests/integration.sh python3 kerberus.py        # starts its own KDC; needs krb5-kdc and krb5-admin-server
+KERBERUS_KCM=1 tests/integration.sh python3 kerberus.py   # the same, with Kerberus as the credential cache
+tests/prompt_e2e.sh python3 kerberus.py         # the prompt and tray on Xvfb; needs xdotool and dbus-x11
 ```
 
-The integration test runs `krb5kdc` and `kadmind` as your user on ports
-18888–18890 (`KDC_PORT=` moves them) with everything in a temporary directory, so
-it doesn't touch `/etc/krb5.conf` or your tickets.
+The tests run `krb5kdc` and `kadmind` as your user on ports 18888–18890
+(`KDC_PORT=` moves them) with everything in a temporary directory
+([`tests/kdc.sh`](tests/kdc.sh)), so they don't touch `/etc/krb5.conf` or your
+tickets. The prompt test plays an app with a renamed copy of `kvno`, answers the
+sign-in window from the keyboard, and reads the tray icon through a stand-in tray
+host ([`tests/fake_tray_host.py`](tests/fake_tray_host.py)).
 
 ### Building the AppImage
 

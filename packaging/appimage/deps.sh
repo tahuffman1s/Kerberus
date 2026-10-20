@@ -8,4 +8,4 @@ apt-get install -y -qq --no-install-recommends \
     libgdk-pixbuf2.0-bin librsvg2-common adwaita-icon-theme hicolor-icon-theme libglib2.0-bin \
     krb5-user krb5-kdc krb5-admin-server \
     patchelf file zsync desktop-file-utils appstream curl ca-certificates \
-    xvfb xauth
+    xvfb xauth xdotool dbus-x11

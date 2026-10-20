@@ -48,8 +48,8 @@ install -Dm644 "$ROOT/kerberus.py" "$APPDIR/usr/share/kerberus/kerberus.py"
 sed -i "s/^VERSION = .*/VERSION = \"$VERSION\"/" "$APPDIR/usr/share/kerberus/kerberus.py"
 grep -q "^VERSION = \"$VERSION\"$" "$APPDIR/usr/share/kerberus/kerberus.py"
 install -Dm644 "$ROOT/data/$APP_ID.desktop" "$APPDIR/usr/share/applications/$APP_ID.desktop"
-install -Dm644 "$ROOT/data/icons/hicolor/scalable/apps/$APP_ID.svg" \
-    "$APPDIR/usr/share/icons/hicolor/scalable/apps/$APP_ID.svg"
+# The app icon and the tray's -inactive and -attention variants.
+install -Dm644 -t "$APPDIR/usr/share/icons/hicolor/scalable/apps" "$ROOT"/data/icons/hicolor/scalable/apps/*.svg
 install -Dm644 "$ROOT/data/$APP_ID.metainfo.xml" "$APPDIR/usr/share/metainfo/$APP_ID.appdata.xml"
 sed -i "s|<releases>|<releases>\n    <release version=\"$VERSION\" date=\"$(date -u +%Y-%m-%d)\"/>|" \
     "$APPDIR/usr/share/metainfo/$APP_ID.appdata.xml"
