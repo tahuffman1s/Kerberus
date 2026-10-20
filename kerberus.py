@@ -887,6 +887,13 @@ def program_name(path):
     return re.sub(r"^\.|-wrapped$|-bin$|\.(mit|heimdal)$", "", os.path.basename(path))
 
 
+def others_can_replace(parent, uid=None):
+    """True if someone else could rename entries in a directory with this stat:
+    it isn't ours, isn't sticky (like /tmp), and others can write to it."""
+    uid = os.getuid() if uid is None else uid
+    return parent.st_uid != uid and not parent.st_mode & 0o1000 and bool(parent.st_mode & 0o022)
+
+
 def descends_from(pid, ancestor):
     for _ in range(64):
         if pid == ancestor:
@@ -914,12 +921,14 @@ class KcmServer:
 
     def start(self):
         self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        # Apps trust whatever answers on this socket with their tickets, so the
-        # directories above it must be ours (the /tmp fallback could be someone else's).
-        for directory in (self.path.parent, self.path.parent.parent):
-            if directory.stat().st_uid != os.getuid():
-                raise RuntimeError(f"{directory} belongs to another user")
-        os.chmod(self.path.parent, 0o700)
+        # Apps trust whatever answers on this socket with their tickets, so its
+        # directory must be ours, and nobody else may be able to swap that
+        # directory out: its parent must be ours, sticky like /tmp, or not
+        # writable by others. (The /tmp fallback could be someone else's.)
+        directory = self.path.parent
+        if directory.stat().st_uid != os.getuid() or others_can_replace(directory.parent.stat()):
+            raise RuntimeError(f"{directory} could be replaced by another user")
+        os.chmod(directory, 0o700)
         if self.path.exists():
             probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             try:

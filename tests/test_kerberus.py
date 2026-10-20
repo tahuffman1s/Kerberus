@@ -321,6 +321,14 @@ class KcmStoreTests(unittest.TestCase):
         finally:
             server.stop()
 
+    def test_socket_directory_safety(self):
+        def st(uid, mode):
+            return type("Stat", (), {"st_uid": uid, "st_mode": mode})()
+        self.assertFalse(kerberus.others_can_replace(st(1000, 0o40700), uid=1000))  # ours
+        self.assertFalse(kerberus.others_can_replace(st(0, 0o41777), uid=1000))     # /tmp: sticky
+        self.assertFalse(kerberus.others_can_replace(st(0, 0o40755), uid=1000))     # nobody else writes
+        self.assertTrue(kerberus.others_can_replace(st(1001, 0o40777), uid=1000))   # someone else's, open
+
 
 if __name__ == "__main__":
     unittest.main()
